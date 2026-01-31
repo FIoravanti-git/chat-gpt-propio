@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp API - Conexión</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+        }
+
+        h1 {
+            color: #25D366;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .status-card {
+            background: #f5f5f5;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        .status-indicator.connected {
+            background: #25D366;
+        }
+
+        .status-indicator.disconnected {
+            background: #ff4444;
+        }
+
+        .status-indicator.waiting {
+            background: #ffaa00;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .status-text {
+            font-weight: 600;
+            color: #333;
+            font-size: 16px;
+        }
+
+        .qr-container {
+            background: white;
+            border: 3px solid #e0e0e0;
+            border-radius: 15px;
+            padding: 30px;
+            margin: 20px 0;
+            min-height: 300px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .qr-container img {
+            max-width: 100%;
+            border-radius: 10px;
+        }
+
+        .qr-placeholder {
+            color: #999;
+            font-size: 14px;
+            padding: 20px;
+        }
+
+        .instructions {
+            background: #e3f2fd;
+            border-left: 4px solid #2196F3;
+            padding: 15px;
+            margin: 20px 0;
+            text-align: left;
+            border-radius: 5px;
+        }
+
+        .instructions h3 {
+            color: #1976D2;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .instructions ol {
+            margin-left: 20px;
+            color: #555;
+            font-size: 14px;
+            line-height: 1.8;
+        }
+
+        .button {
+            background: #25D366;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            margin: 10px 5px;
+            transition: all 0.3s;
+        }
+
+        .button:hover {
+            background: #20ba5a;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(37, 211, 102, 0.3);
+        }
+
+        .button.secondary {
+            background: #666;
+        }
+
+        .button.secondary:hover {
+            background: #555;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .refresh-info {
+            color: #666;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📱 WhatsApp API</h1>
+        <p class="subtitle">Conecta tu cuenta de WhatsApp</p>
+
+        <div class="status-card">
+            <span id="statusIndicator" class="status-indicator disconnected"></span>
+            <span id="statusText" class="status-text">Desconectado</span>
+        </div>
+
+        <div class="qr-container" id="qrContainer">
+            <div class="qr-placeholder" id="qrPlaceholder">
+                Generando código QR...
+            </div>
+            <img id="qrImage" class="hidden" alt="QR Code">
+        </div>
+
+        <div class="instructions hidden" id="instructions">
+            <h3>📋 Instrucciones:</h3>
+            <ol>
+                <li>Abre WhatsApp en tu teléfono</li>
+                <li>Ve a <strong>Configuración</strong> → <strong>Dispositivos vinculados</strong></li>
+                <li>Toca <strong>Vincular un dispositivo</strong></li>
+                <li>Escanea el código QR que aparece arriba</li>
+            </ol>
+        </div>
+
+        <div>
+            <button class="button" onclick="reconnect()">
+                <span id="reconnectText">Reconectar</span>
+                <span id="reconnectLoading" class="loading hidden"></span>
+            </button>
+            <button class="button secondary" onclick="refreshStatus()">
+                Actualizar Estado
+            </button>
+        </div>
+
+        <p class="refresh-info">La página se actualiza automáticamente cada 2 segundos</p>
+    </div>
+
+    <script>
+        let checkInterval = null;
+
+        async function updateStatus() {
+            try {
+                const statusResponse = await fetch('/api/status');
+                const status = await statusResponse.json();
+                
+                const statusIndicator = document.getElementById('statusIndicator');
+                const statusText = document.getElementById('statusText');
+                const qrContainer = document.getElementById('qrContainer');
+                const qrImage = document.getElementById('qrImage');
+                const qrPlaceholder = document.getElementById('qrPlaceholder');
+                const instructions = document.getElementById('instructions');
+
+                if (status.ready && status.connected) {
+                    // Conectado
+                    statusIndicator.className = 'status-indicator connected';
+                    statusText.textContent = '✅ Conectado';
+                    qrImage.classList.add('hidden');
+                    qrPlaceholder.textContent = '¡WhatsApp está conectado exitosamente!';
+                    instructions.classList.add('hidden');
+                } else {
+                    // No conectado - mostrar QR
+                    statusIndicator.className = 'status-indicator waiting';
+                    statusText.textContent = '⏳ Esperando conexión...';
+                    instructions.classList.remove('hidden');
+
+                    const qrResponse = await fetch('/api/qr');
+                    const qrData = await qrResponse.json();
+
+                    if (qrData.qr) {
+                        qrImage.src = qrData.qr;
+                        qrImage.classList.remove('hidden');
+                        qrPlaceholder.classList.add('hidden');
+                    } else {
+                        qrImage.classList.add('hidden');
+                        qrPlaceholder.textContent = 'Generando código QR...';
+                        qrPlaceholder.classList.remove('hidden');
+                    }
+                }
+            } catch (error) {
+                console.error('Error actualizando estado:', error);
+                const statusIndicator = document.getElementById('statusIndicator');
+                const statusText = document.getElementById('statusText');
+                statusIndicator.className = 'status-indicator disconnected';
+                statusText.textContent = '❌ Error de conexión';
+            }
+        }
+
+        function refreshStatus() {
+            updateStatus();
+        }
+
+        async function reconnect() {
+            const reconnectText = document.getElementById('reconnectText');
+            const reconnectLoading = document.getElementById('reconnectLoading');
+            
+            reconnectText.classList.add('hidden');
+            reconnectLoading.classList.remove('hidden');
+
+            try {
+                const response = await fetch('/api/reconnect', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                // Esperar un momento y actualizar
+                setTimeout(() => {
+                    updateStatus();
+                    reconnectText.classList.remove('hidden');
+                    reconnectLoading.classList.add('hidden');
+                }, 2000);
+            } catch (error) {
+                console.error('Error reconectando:', error);
+                reconnectText.classList.remove('hidden');
+                reconnectLoading.classList.add('hidden');
+            }
+        }
+
+        // Actualizar estado cada 2 segundos
+        updateStatus();
+        checkInterval = setInterval(updateStatus, 2000);
+
+        // Actualizar cuando la ventana recupera el foco
+        window.addEventListener('focus', updateStatus);
+    </script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "connection": "open",
+  "qr": null,
+  "lastDisconnect": null,
+  "isNewLogin": true,
+  "isOnline": true,
+  "receivedPendingNotifications": false,
+  "user": {
+    "id": "595986782672:48@s.whatsapp.net",
+    "name": "Usuario",
+    "phone": {
+      "wa_version": "2.24.7.84",
+      "mcc": "744",
+      "mnc": "01",
+      "os_version": "Android 13",
+      "device_manufacturer": "Samsung",
+      "device_model": "SM-G991B",
+      "os_build_number": "TP1A.220624.014"
+    }
+  }
+}

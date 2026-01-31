@@ -1,0 +1,49 @@
+# Entorno y credenciales
+.env
+.env.local
+.env.*.local
+
+# Bases de datos (no subir datos locales)
+*.db
+*.db-shm
+*.db-wal
+auth.db
+auth.db-shm
+auth.db-wal
+
+# Sesiones y datos sensibles
+whatsapp/baileys_auth/
+*.pid
+
+# Logs
+*.log
+whatsapp/whatsapp.log
+
+# Node
+node_modules/
+
+# Build / dist
+dist/
+dist-ssr/
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+ENV/
+
+# IDE y OS
+.DS_Store
+.idea
+.vscode/*
+*.suo
+*.sw?
+Thumbs.db
+
+# Front auth server (BD local)
+front-chatgpt/server/auth.db
+front-chatgpt/server/auth.db-shm
+front-chatgpt/server/auth.db-wal

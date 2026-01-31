@@ -1,0 +1,13 @@
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Icono monocrom�tico moderno - dise�o minimalista -->
+  <!-- C�rculo principal -->
+  <circle cx="50" cy="50" r="38" fill="none" stroke="#000000" stroke-width="6"/>
+  <!-- C�rculos internos -->
+  <circle cx="50" cy="50" r="22" fill="#000000"/>
+  <circle cx="50" cy="50" r="10" fill="#000000"/>
+  <!-- L�neas decorativas en los 4 puntos cardinales -->
+  <line x1="50" y1="8" x2="50" y2="26" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
+  <line x1="50" y1="74" x2="50" y2="92" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
+  <line x1="8" y1="50" x2="26" y2="50" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
+  <line x1="74" y1="50" x2="92" y2="50" stroke="#000000" stroke-width="5" stroke-linecap="round"/>
+</svg>

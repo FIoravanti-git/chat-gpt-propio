@@ -1,0 +1,28 @@
+{
+  "type": "notify",
+  "messages": [
+    {
+      "key": {
+        "remoteJid": "595986782672@s.whatsapp.net",
+        "fromMe": false,
+        "id": "3EB0A1B2C3D4E5F6",
+        "participant": null
+      },
+      "messageTimestamp": 1706234567,
+      "pushName": "Usuario",
+      "message": {
+        "extendedTextMessage": {
+          "text": "Este es un mensaje de texto extendido con más caracteres",
+          "contextInfo": {
+            "quotedMessage": {
+              "conversation": "Mensaje citado"
+            },
+            "mentionedJid": ["595986782672@s.whatsapp.net"]
+          }
+        }
+      },
+      "messageType": "extendedTextMessage",
+      "status": 1
+    }
+  ]
+}

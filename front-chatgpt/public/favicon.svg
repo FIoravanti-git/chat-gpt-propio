@@ -1,0 +1,14 @@
+<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .logo-filter-dark {
+        filter: grayscale(100%) brightness(0) invert(1);
+      }
+      .logo-filter-light {
+        filter: grayscale(100%) brightness(0);
+      }
+    </style>
+  </defs>
+  <!-- Usar el PNG original con filtros para modo oscuro por defecto -->
+  <image href="/Logo_tabacman.png" width="32" height="32" class="logo-filter-dark"/>
+</svg>

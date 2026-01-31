@@ -1,0 +1,53 @@
+{
+  "ejemplos": {
+    "api_status_conectado": {
+      "ready": true,
+      "connected": true,
+      "whatsapp_id": "138916556447751",
+      "whatsapp_number": "595972908588"
+    },
+    "api_status_desconectado": {
+      "ready": false,
+      "connected": false,
+      "whatsapp_id": null,
+      "whatsapp_number": null
+    },
+    "api_link_phone_request": {
+      "phoneNumber": "595972908588"
+    },
+    "api_link_phone_response": {
+      "success": true,
+      "message": "Número vinculado correctamente",
+      "whatsappId": "138916556447751",
+      "whatsapp_id": "138916556447751",
+      "phoneNumber": "595972908588",
+      "whatsapp_number": "595972908588",
+      "userId": 3,
+      "wasLinked": false,
+      "previousUserId": null,
+      "rowsAffected": 1
+    },
+    "api_users_response": [
+      {
+        "id": 1,
+        "username": "admin",
+        "role": "admin",
+        "whatsapp_id": "595986782672",
+        "whatsapp_number": "595986782672"
+      },
+      {
+        "id": 3,
+        "username": "diosnel",
+        "role": "user",
+        "whatsapp_id": "138916556447751",
+        "whatsapp_number": "595972908588"
+      }
+    ],
+    "nota_importante": {
+      "whatsapp_id": "Es el ID interno de WhatsApp (ej: 138916556447751)",
+      "whatsapp_number": "Es el número telefónico real (ej: 595972908588)",
+      "relacion": "NO tienen relación matemática, son números completamente distintos",
+      "independencia": "Deben tratarse como valores independientes"
+    }
+  }
+}

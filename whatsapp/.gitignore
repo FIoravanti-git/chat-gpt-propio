@@ -1,0 +1,9 @@
+node_modules/
+whatsapp-session/
+.env
+*.log
+.DS_Store
+baileys_auth/
+whatsapp.log
+*.pid
+whatsapp.db

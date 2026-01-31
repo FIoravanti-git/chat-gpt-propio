@@ -1,0 +1,40 @@
+workflow_config:
+  name: "standard RAG"
+  nodes:
+    - name: "START"
+      edges: ["filter_history"]
+
+    - name: "filter_history"
+      edges: ["rewrite"]
+
+    - name: "rewrite"
+      edges: ["retrieve"]
+
+    - name: "retrieve"
+      edges: ["generate_rag"]
+
+    - name: "generate_rag" # el nombre del último nodo, desde donde queremos transmitir la respuesta al usuario
+      edges: ["END"]
+
+# Número máximo de iteraciones de conversación previas
+# para incluir en el contexto de la respuesta
+max_history: 10
+
+# Configuración del reranker
+reranker_config:
+  # El proveedor del reranker a usar
+  supplier: "cohere"
+
+  # El modelo a usar para el reranker para el proveedor dado
+  model: "rerank-multilingual-v3.0"
+
+  # Número de chunks devueltos por el reranker
+  top_n: 5
+
+# Configuración para el LLM
+llm_config:
+  # número máximo de tokens pasados al LLM para generar la respuesta
+  max_input_tokens: 4000
+
+  # temperatura para el LLM
+  temperature: 0.3

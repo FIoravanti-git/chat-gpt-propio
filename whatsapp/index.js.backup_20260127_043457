@@ -1,0 +1,2012 @@
+// Hacer crypto disponible globalmente ANTES de importar Baileys
+const cryptoModule = require('crypto');
+if (typeof global.crypto === 'undefined') {
+  global.crypto = cryptoModule.webcrypto || cryptoModule;
+}
+
+const express = require('express');
+const { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('baileys');
+const QRCode = require('qrcode');
+const axios = require('axios');
+const dotenv = require('dotenv');
+const path = require('path');
+const pino = require('pino');
+const sqlite3 = require('sqlite3').verbose();
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+app.use(express.static('public'));
+
+const PORT = process.env.PORT || 3000;
+const QUIVR_URL = process.env.QUIVR_URL || 'http://localhost:8000';
+
+// Ruta a la base de datos de autenticación (compartida con auth-server)
+const AUTH_DB_PATH = path.join(__dirname, '../front-chatgpt/server/auth.db');
+
+// Logger
+const logger = pino({ level: 'silent' });
+
+// Almacenamiento de webhooks
+let webhooks = [];
+
+// Configuración de Quivr
+let quivrConfig = {
+  enabled: process.env.QUIVR_ENABLED === 'true' || true, // Por defecto habilitado
+  url: QUIVR_URL,
+  endpoint: process.env.QUIVR_ENDPOINT || '/ask',
+  ignoreGroups: process.env.QUIVR_IGNORE_GROUPS === 'true' || false,
+  chatId: process.env.QUIVR_CHAT_ID || null
+};
+
+// ✅ REFACTORIZADO: Clientes de WhatsApp por usuario (NO global)
+// Cada usuario tiene su propia conexión de WhatsApp
+const userSockets = new Map(); // Map<userId, { socket, isReady, currentQR, whatsappId, whatsappNumber, qrScannedBy }>
+
+// Estructura de datos por usuario:
+// {
+//   socket: WebSocket de Baileys,
+//   isReady: boolean,
+//   currentQR: string | null,
+//   whatsappId: string | null,
+//   whatsappNumber: string | null,
+//   qrScannedBy: userId | null  // Usuario que escaneó el QR (vinculación exclusiva)
+// }
+
+// Función helper para acceder a la base de datos
+function getDb() {
+  return new sqlite3.Database(AUTH_DB_PATH);
+}
+
+// Normalizar número de teléfono para búsqueda consistente
+function normalizePhoneNumber(phoneNumber) {
+  // Remover sufijos de WhatsApp (@s.whatsapp.net, @g.us, etc.)
+  let normalized = phoneNumber.replace(/@[^@]+$/, '');
+  // Remover caracteres no numéricos excepto +
+  normalized = normalized.replace(/[^\d+]/g, '');
+  return normalized;
+}
+
+// Obtener número de WhatsApp real del usuario (solo dígitos)
+function getUserRealPhoneNumber(userId) {
+  return new Promise((resolve, reject) => {
+    const db = getDb();
+    // PRIORIDAD 1: Buscar en users.whatsapp_number (número real normalizado)
+    db.get(
+      'SELECT whatsapp_number FROM users WHERE id = ?',
+      [userId],
+      (err, row) => {
+        if (err) {
+          db.close();
+          console.error('Error obteniendo número real del usuario:', err);
+          resolve(null);
+        } else if (row && row.whatsapp_number) {
+          db.close();
+          console.log(`✅ Número real encontrado en users.whatsapp_number: ${row.whatsapp_number}`);
+          resolve(row.whatsapp_number);
+        } else {
+          // PRIORIDAD 2: Si no hay whatsapp_phone_number, obtener desde whatsapp_sessions y normalizar
+          const db2 = getDb();
+          db2.get(
+            'SELECT phone_number FROM whatsapp_sessions WHERE user_id = ? LIMIT 1',
+            [userId],
+            (err2, row2) => {
+              db2.close();
+              if (err2) {
+                console.error('Error obteniendo número desde whatsapp_sessions:', err2);
+                resolve(null);
+              } else if (row2 && row2.phone_number) {
+                // Normalizar el número de la sesión
+                const normalized = normalizePhoneNumber(row2.phone_number);
+                console.log(`✅ Número obtenido desde whatsapp_sessions y normalizado: ${normalized}`);
+                resolve(normalized);
+              } else {
+                console.warn(`⚠️  No se encontró número de WhatsApp para usuario ${userId}`);
+                resolve(null);
+              }
+            }
+          );
+        }
+      }
+    );
+  });
+}
+
+// Obtener user_id desde número de teléfono o sesión
+// PRIORIDAD: Buscar primero por whatsapp_number (número real) para validar usuario conectado
+function getUserFromPhoneNumber(phoneNumber) {
+  return new Promise((resolve, reject) => {
+    const db = getDb();
+    // Normalizar número para búsqueda consistente (solo dígitos)
+    const normalizedNumber = normalizePhoneNumber(phoneNumber);
+    
+    console.log(`🔍 Buscando usuario para número: ${phoneNumber} (normalizado: ${normalizedNumber})`);
+    
+    // PRIORIDAD 1: Buscar en users.whatsapp_number (número real del usuario)
+    // Este es el campo principal para validar si corresponde al usuario conectado
+    db.get(
+      `SELECT id FROM users 
+       WHERE whatsapp_number = ? 
+       OR whatsapp_number = ?`,
+      [normalizedNumber, phoneNumber],
+      (err1, userRow1) => {
+        if (err1) {
+          console.error('Error buscando usuario por whatsapp_number:', err1);
+        } else if (userRow1) {
+          db.close();
+          console.log(`✅ Usuario encontrado en tabla users (whatsapp_number): ${userRow1.id}`);
+          console.log(`✅ Validación: El número ${normalizedNumber} corresponde al usuario ${userRow1.id}`);
+          resolve(userRow1.id);
+          return;
+        }
+        
+        // PRIORIDAD 2: Buscar en whatsapp_sessions por número exacto (formato completo con sufijos)
+        // Esto es importante porque los mensajes pueden llegar con diferentes formatos (@s.whatsapp.net, @lid, etc.)
+        db.get(
+          'SELECT user_id FROM whatsapp_sessions WHERE phone_number = ?',
+          [phoneNumber],
+          (err2, row2) => {
+            if (err2) {
+              console.error('Error buscando en whatsapp_sessions (formato exacto):', err2);
+            } else if (row2) {
+              db.close();
+              console.log(`✅ Usuario encontrado en whatsapp_sessions (formato exacto): ${row2.user_id}`);
+              resolve(row2.user_id);
+              return;
+            }
+            
+            // PRIORIDAD 3: Buscar en whatsapp_sessions con número normalizado + diferentes sufijos
+            // Probar con @s.whatsapp.net, @lid, y otros formatos comunes
+            db.get(
+              `SELECT user_id FROM whatsapp_sessions 
+               WHERE phone_number LIKE ? 
+               OR phone_number LIKE ?
+               OR phone_number = ?`,
+              [`${normalizedNumber}@%`, `%${normalizedNumber}%`, normalizedNumber],
+              (err3, row3) => {
+                if (err3) {
+                  console.error('Error buscando en whatsapp_sessions (variantes):', err3);
+                } else if (row3) {
+                  db.close();
+                  console.log(`✅ Usuario encontrado en whatsapp_sessions (variantes): ${row3.user_id}`);
+                  resolve(row3.user_id);
+                  return;
+                }
+                
+                // PRIORIDAD 4: Buscar en la tabla users por whatsapp_id (formato completo con sufijo)
+                // Los mensajes llegan con formato @lid, así que debemos buscar con ese formato
+                // También buscar variantes para compatibilidad
+                const searchVariantsForUsers = [
+                  phoneNumber, // Formato exacto del mensaje (ej: 138916556447751@lid)
+                  `${normalizedNumber}@lid`, // Formato normalizado con @lid
+                  `${normalizedNumber}@s.whatsapp.net`, // Formato alternativo
+                  normalizedNumber // Solo número para compatibilidad
+                ];
+                db.get(
+                  `SELECT id FROM users 
+                   WHERE whatsapp_id = ? 
+                   OR whatsapp_id = ?
+                   OR whatsapp_id = ?
+                   OR whatsapp_id = ?
+                   OR whatsapp_id LIKE ?`,
+                  [...searchVariantsForUsers, `%${normalizedNumber}%`],
+                  (err4, userRow2) => {
+                    db.close();
+                    if (err4) {
+                      console.error('Error buscando usuario por whatsapp_id:', err4);
+                      reject(err4);
+                    } else if (userRow2) {
+                      console.log(`✅ Usuario encontrado en tabla users (whatsapp_id): ${userRow2.id}`);
+                      resolve(userRow2.id);
+                    } else {
+                      // No se encontró usuario - retornar null (aislamiento estricto)
+                      console.warn(`⚠️  No se encontró usuario para número: ${phoneNumber} (normalizado: ${normalizedNumber})`);
+                      console.warn(`⚠️  Buscado en: users.whatsapp_number, whatsapp_sessions.phone_number, users.whatsapp_id`);
+                      resolve(null);
+                    }
+                  }
+                );
+              }
+            );
+          }
+        );
+      }
+    );
+  });
+}
+
+// Obtener token del usuario
+function getUserToken(userId) {
+  return new Promise((resolve, reject) => {
+    const db = getDb();
+    db.get(
+      'SELECT token FROM users WHERE id = ?',
+      [userId],
+      (err, row) => {
+        db.close();
+        if (err) {
+          reject(err);
+        } else if (row && row.token) {
+          resolve(row.token);
+        } else {
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+// Obtener user_id desde token de autenticación
+function getUserIdFromToken(token) {
+  return new Promise((resolve, reject) => {
+    if (!token) {
+      resolve(null);
+      return;
+    }
+    
+    const db = getDb();
+    // Limpiar el token (puede venir con "Bearer " prefix)
+    const cleanToken = token.replace(/^Bearer\s+/i, '');
+    
+    db.get(
+      'SELECT id, username FROM users WHERE token = ?',
+      [cleanToken],
+      (err, row) => {
+        db.close();
+        if (err) {
+          reject(err);
+        } else if (row) {
+          resolve(row.id);
+        } else {
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+// Obtener o crear conversación de WhatsApp para un usuario
+function getOrCreateWhatsAppConversation(userId, phoneNumber) {
+  return new Promise((resolve, reject) => {
+    const db = getDb();
+    // Buscar conversación existente de WhatsApp para este usuario
+    db.get(
+      `SELECT c.id, c.title, c.updated_at 
+       FROM conversations c
+       JOIN whatsapp_sessions w ON c.whatsapp_session_id = w.id
+       WHERE c.user_id = ? AND c.channel = 'whatsapp' AND w.phone_number = ?
+       ORDER BY c.updated_at DESC
+       LIMIT 1`,
+      [userId, phoneNumber],
+      (err, row) => {
+        if (err) {
+          db.close();
+          reject(err);
+        } else if (row) {
+          db.close();
+          resolve(row.id);
+        } else {
+          // Crear nueva conversación
+          // Primero obtener o crear sesión de WhatsApp
+          db.get(
+            'SELECT id FROM whatsapp_sessions WHERE user_id = ?',
+            [userId],
+            (err2, sessionRow) => {
+              if (err2) {
+                db.close();
+                reject(err2);
+              } else {
+                let sessionId = sessionRow ? sessionRow.id : null;
+                
+                // Si no hay sesión, crear una
+                if (!sessionId) {
+                  db.run(
+                    'INSERT INTO whatsapp_sessions (user_id, phone_number, status) VALUES (?, ?, ?)',
+                    [userId, phoneNumber, 'connected'],
+                    function(err3) {
+                      if (err3) {
+                        db.close();
+                        reject(err3);
+                      } else {
+                        sessionId = this.lastID;
+                        // Crear conversación
+                        db.run(
+                          'INSERT INTO conversations (user_id, channel, whatsapp_session_id, title) VALUES (?, ?, ?, ?)',
+                          [userId, 'whatsapp', sessionId, `Chat WhatsApp ${phoneNumber}`],
+                          function(err4) {
+                            db.close();
+                            if (err4) {
+                              reject(err4);
+                            } else {
+                              resolve(this.lastID);
+                            }
+                          }
+                        );
+                      }
+                    }
+                  );
+                } else {
+                  // Crear conversación con sesión existente
+                  db.run(
+                    'INSERT INTO conversations (user_id, channel, whatsapp_session_id, title) VALUES (?, ?, ?, ?)',
+                    [userId, 'whatsapp', sessionId, `Chat WhatsApp ${phoneNumber}`],
+                    function(err4) {
+                      db.close();
+                      if (err4) {
+                        reject(err4);
+                      } else {
+                        resolve(this.lastID);
+                      }
+                    }
+                  );
+                }
+              }
+            }
+          );
+        }
+      }
+    );
+  });
+}
+
+// Guardar mensaje en la base de datos y auditoría
+function saveMessage(conversationId, userId, role, content, phoneNumber = null, whatsappId = null) {
+  return new Promise((resolve, reject) => {
+    const db = getDb();
+    db.run(
+      'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)',
+      [conversationId, role, content],
+      function(err) {
+        if (err) {
+          db.close();
+          reject(err);
+          return;
+        }
+        
+        const messageId = this.lastID;
+        
+        // Actualizar updated_at de la conversación
+        db.run(
+          'UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [conversationId],
+          (err2) => {
+            if (err2) {
+              console.error('Error actualizando conversación:', err2);
+            }
+            
+            // AUDITORÍA: Registrar en tabla de auditoría
+            // IMPORTANTE: Aplicar la misma lógica que en la tabla users
+            // whatsapp_id: ID de WhatsApp sin sufijo (ej: 138916556447751) - sin @s.whatsapp.net ni @lid
+            // whatsapp_number: Número real de teléfono (solo dígitos, ej: 595972908588) - diferente al whatsapp_id
+            const direction = role === 'user' ? 'incoming' : 'outgoing';
+            
+            // Normalizar número real (solo dígitos) - este es whatsapp_number
+            // Debe ser el número real de teléfono del usuario, no el ID de WhatsApp
+            const phoneNumberOnly = phoneNumber ? (phoneNumber.includes('@') ? normalizePhoneNumber(phoneNumber) : phoneNumber) : null;
+            
+            // Normalizar ID de WhatsApp (solo número, sin sufijo) - este es whatsapp_id
+            // Debe ser el ID de WhatsApp sin sufijo (ej: 138916556447751), sin @s.whatsapp.net ni @lid
+            let whatsappIdOnly = null;
+            if (whatsappId) {
+              // Remover cualquier sufijo (@s.whatsapp.net, @lid, :algo, etc.)
+              whatsappIdOnly = whatsappId.split('@')[0].split(':')[0];
+            }
+            
+            console.log(`📝 Auditoría - whatsapp_id: ${whatsappIdOnly || 'NULL'}, whatsapp_number: ${phoneNumberOnly || 'NULL'}`);
+            console.log(`📝 Nota: whatsapp_id es el ID de WhatsApp sin sufijo, whatsapp_number es el número real de teléfono`);
+            db.run(
+              `INSERT INTO conversation_audit 
+               (user_id, conversation_id, channel, direction, role, content, whatsapp_id, whatsapp_number, message_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [userId, conversationId, 'whatsapp', direction, role, content, whatsappIdOnly, phoneNumberOnly, messageId],
+              (err3) => {
+                db.close();
+                if (err3) {
+                  console.error('Error guardando auditoría:', err3);
+                  // No fallar si falla la auditoría, solo loguear
+                }
+                resolve(messageId);
+              }
+            );
+          }
+        );
+      }
+    );
+  });
+}
+
+// Función para consultar Quivr con contexto del usuario
+async function queryQuivr(message, userToken, conversationId = null) {
+  try {
+    const quivrEndpoint = `${quivrConfig.url}${quivrConfig.endpoint}`;
+    console.log('Consultando Quivr en:', quivrEndpoint);
+    console.log('Usuario autenticado, usando contexto específico del usuario');
+    
+    const payload = {
+      question: message
+    };
+    
+    // Agregar conversation_id si está disponible (para contexto histórico)
+    if (conversationId) {
+      payload.conversation_id = conversationId;
+    }
+    
+    // Agregar channel
+    payload.channel = 'whatsapp';
+    
+    if (quivrConfig.k) payload.k = quivrConfig.k;
+    if (quivrConfig.temperature !== undefined) payload.temperature = quivrConfig.temperature;
+    
+    console.log('Payload enviado a Quivr:', JSON.stringify(payload));
+
+    // Enviar token del usuario para que Quivr use su contexto
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+    
+    if (userToken) {
+      headers['Authorization'] = `Bearer ${userToken}`;
+      // También soportar X-Auth-Token como alternativa
+      headers['X-Auth-Token'] = userToken;
+    }
+
+    const response = await axios.post(quivrEndpoint, payload, {
+      headers: headers,
+      timeout: 30000
+    });
+
+    let answer = null;
+    if (response.data) {
+      answer = response.data.answer || 
+               response.data.response || 
+               response.data.message || 
+               response.data.text ||
+               (typeof response.data === 'string' ? response.data : JSON.stringify(response.data));
+    }
+
+    return answer || 'No pude obtener una respuesta de Quivr.';
+  } catch (error) {
+    console.error('Error consultando Quivr:', error.message);
+    if (error.response) {
+      console.error('Respuesta de Quivr:', error.response.status, error.response.data);
+    }
+    // NO usar fallback a contexto global - lanzar error si no hay token válido
+    if (error.response && error.response.status === 401) {
+      throw new Error('Usuario no autenticado. No se puede acceder al contexto del usuario.');
+    }
+    throw error;
+  }
+}
+
+// ✅ REFACTORIZADO: Inicializar cliente de WhatsApp para un usuario específico
+// IMPORTANTE: Cada usuario debe tener su propia conexión
+async function initializeWhatsApp(userId) {
+  if (!userId) {
+    throw new Error('userId es requerido para inicializar WhatsApp');
+  }
+  
+  console.log(`🔧 Inicializando WhatsApp para usuario ${userId}`);
+  
+  // Directorio de autenticación específico por usuario
+  const authDir = path.join(__dirname, 'baileys_auth', `user_${userId}`);
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  
+  const { version } = await fetchLatestBaileysVersion();
+  
+  // ✅ CRÍTICO: Crear socket como variable local, NO global
+  const socket = makeWASocket({
+    version,
+    logger,
+    printQRInTerminal: true,
+    auth: state,
+    browser: ['Chrome', 'Chrome', '120.0'],
+    // Configuración adicional para mejorar la conexión
+    connectTimeoutMs: 90000,
+    defaultQueryTimeoutMs: 90000,
+    keepAliveIntervalMs: 30000,
+    qrTimeout: 120000, // 120 segundos para escanear el QR
+    // Configuración adicional para evitar errores de conexión
+    markOnlineOnConnect: true,
+    syncFullHistory: false,
+    generateHighQualityLinkPreview: false,
+    // Configuración para evitar errores 428
+    retryRequestDelayMs: 250,
+    maxMsgRetryCount: 3,
+    getMessage: async (key) => {
+      return {
+        conversation: 'Mensaje no disponible'
+      };
+    }
+  });
+
+  socket.ev.on('creds.update', saveCreds);
+  
+  // ✅ CRÍTICO: Verificar si ya hay una sesión activa Y validar que pertenece a este usuario
+  setTimeout(async () => {
+    const userDataCheck = userSockets.get(userId);
+    if (userDataCheck && userDataCheck.socket && userDataCheck.socket.user) {
+      const fullId = userDataCheck.socket.user.id;
+      const whatsappIdFromSession = fullId.split(':')[0].split('@')[0];
+      
+      // ✅ VALIDACIÓN CRÍTICA: Verificar que este whatsapp_id pertenece realmente a este usuario
+      const db = getDb();
+      db.get(
+        'SELECT id, whatsapp_id FROM users WHERE id = ? AND whatsapp_id = ?',
+        [userId, whatsappIdFromSession],
+        (err, userRow) => {
+          db.close();
+          
+          if (err) {
+            console.error(`❌ [Usuario ${userId}] Error validando sesión existente:`, err);
+            // Si hay error, NO marcar como listo - forzar nuevo QR
+            return;
+          }
+          
+          if (userRow && userRow.id === userId && userRow.whatsapp_id === whatsappIdFromSession) {
+            // ✅ Sesión válida: pertenece a este usuario
+            console.log(`✅ [Usuario ${userId}] Sesión existente válida detectada, marcando como listo`);
+            userDataCheck.isReady = true;
+            userDataCheck.currentQR = null;
+            userDataCheck.whatsappId = whatsappIdFromSession;
+          } else {
+            // ❌ CRÍTICO: Esta sesión NO pertenece a este usuario
+            console.error(`❌ [Usuario ${userId}] Sesión existente NO válida - whatsapp_id ${whatsappIdFromSession} no pertenece a este usuario`);
+            console.error(`❌ [Usuario ${userId}] Cerrando sesión inválida y forzando nuevo QR`);
+            // Cerrar socket y limpiar sesión
+            if (userDataCheck.socket) {
+              userDataCheck.socket.end();
+              userDataCheck.socket = null;
+            }
+            userSockets.delete(userId);
+            // Limpiar directorio de autenticación para forzar nuevo QR
+            const fs = require('fs');
+            const authDir = path.join(__dirname, 'baileys_auth', `user_${userId}`);
+            try {
+              const credsPath = path.join(authDir, 'creds.json');
+              if (fs.existsSync(credsPath)) {
+                fs.unlinkSync(credsPath);
+                console.log(`✅ [Usuario ${userId}] Sesión inválida eliminada`);
+              }
+            } catch (cleanErr) {
+              console.error(`[Usuario ${userId}] Error limpiando sesión inválida:`, cleanErr);
+            }
+          }
+        }
+      );
+    }
+  }, 3000);
+
+  // ✅ REFACTORIZADO: Manejo de QR y conexión específico por usuario
+  socket.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    const userData = userSockets.get(userId);
+
+    if (!userData) {
+      console.error(`❌ Error: No se encontró datos para usuario ${userId}`);
+      return;
+    }
+
+    console.log(`🔄 [Usuario ${userId}] Estado de conexión:`, connection, 'QR disponible:', !!qr);
+    console.log(`🔄 [Usuario ${userId}] JSON completo del connection.update:`, JSON.stringify(update, null, 2));
+
+    // Generar QR si está disponible
+    if (qr) {
+      console.log(`📱 [Usuario ${userId}] Generando QR para conectar...`);
+      console.log(`📱 [Usuario ${userId}] QR recibido, generando imagen...`);
+      QRCode.toDataURL(qr, {
+        errorCorrectionLevel: 'M',
+        type: 'image/png',
+        quality: 0.92,
+        margin: 1
+      }).then((dataUrl) => {
+        userData.currentQR = dataUrl;
+        userData.qrScannedBy = userId; // Marcar que este QR pertenece a este usuario
+        console.log(`✅ [Usuario ${userId}] QR generado correctamente`);
+        console.log(`📱 [Usuario ${userId}] QR disponible en /api/qr - Escanea este código con WhatsApp`);
+        console.log(`⏱️  [Usuario ${userId}] El QR expira en ~20 segundos, se generará uno nuevo automáticamente`);
+      }).catch((err) => {
+        console.error(`❌ [Usuario ${userId}] Error generando QR:`, err);
+        userData.currentQR = null;
+      });
+    } else {
+      // Si no hay QR y no está conectado, limpiar QR anterior
+      if (connection !== 'open' && !userData.isReady) {
+        // Si está en estado 'connecting' y no hay QR después de un tiempo, puede necesitar forzar QR
+        if (connection === 'connecting') {
+          console.log(`⏳ [Usuario ${userId}] Conectando... Si tarda mucho, puede necesitar nuevo QR`);
+        }
+        userData.currentQR = null;
+      }
+    }
+
+    // ✅ REFACTORIZADO: Manejar estado de conexión específico por usuario
+    if (connection === 'close') {
+      const error = lastDisconnect?.error;
+      const statusCode = error?.output?.statusCode;
+      const errorMessage = error?.message || error?.toString() || '';
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      
+      console.log(`[Usuario ${userId}] Conexión cerrada. Error:`, errorMessage);
+      console.log(`[Usuario ${userId}] Código de estado:`, statusCode);
+      console.log(`[Usuario ${userId}] Reconectando:`, shouldReconnect);
+      
+      userData.isReady = false;
+      
+      // Detectar errores específicos que requieren limpiar sesión
+      // NOTA: "restart required" (515) puede ser temporal, no siempre requiere limpiar sesión
+      // Solo limpiar si es un error crítico de autenticación o sesión corrupta
+      const needsSessionCleanup = 
+        statusCode === 401 || 
+        statusCode === DisconnectReason.badSession ||
+        (statusCode === DisconnectReason.restartRequired && errorMessage.includes('conflict')) ||
+        errorMessage.includes('conflict') ||
+        (errorMessage.includes('Stream Errored') && errorMessage.includes('conflict'));
+      
+      // Para "restart required" sin conflicto, solo reconectar sin limpiar sesión
+      const isRestartRequired = 
+        statusCode === DisconnectReason.restartRequired ||
+        (errorMessage.includes('restart required') && !errorMessage.includes('conflict'));
+      
+      if (needsSessionCleanup) {
+        console.log(`⚠️ [Usuario ${userId}] Error crítico detectado que requiere limpiar sesión. Eliminando sesión para generar nuevo QR...`);
+        console.log(`⚠️ [Usuario ${userId}] Detalles del error - StatusCode: ${statusCode}, Message: ${errorMessage}`);
+        userData.currentQR = null;
+        userData.isReady = false;
+        
+        // Cerrar socket actual si existe
+        if (userData.socket) {
+          try {
+            userData.socket.end();
+            userData.socket = null;
+          } catch (err) {
+            console.error(`[Usuario ${userId}] Error cerrando socket:`, err);
+          }
+        }
+        
+        // Limpiar sesión corrupta específica del usuario
+        const fs = require('fs');
+        const authDir = path.join(__dirname, 'baileys_auth', `user_${userId}`);
+        try {
+          // Eliminar creds.json si existe
+          const credsPath = path.join(authDir, 'creds.json');
+          if (fs.existsSync(credsPath)) {
+            fs.unlinkSync(credsPath);
+            console.log(`✅ [Usuario ${userId}] creds.json eliminado`);
+          }
+          
+          // Limpiar también otros archivos de sesión críticos
+          if (fs.existsSync(authDir)) {
+            const files = fs.readdirSync(authDir);
+            const criticalFiles = files.filter(f => 
+              f.startsWith('app-state-sync-key-') || 
+              f.startsWith('app-state-sync-version-') ||
+              f.startsWith('pre-key-') ||
+              f.startsWith('session-') ||
+              f.startsWith('sender-key-')
+            );
+            
+            if (criticalFiles.length > 0) {
+              console.log(`⚠️ [Usuario ${userId}] Limpiando ${criticalFiles.length} archivos de sesión críticos...`);
+              criticalFiles.forEach(file => {
+                try {
+                  fs.unlinkSync(path.join(authDir, file));
+                  console.log(`✅ [Usuario ${userId}] Eliminado: ${file}`);
+                } catch (err) {
+                  console.error(`[Usuario ${userId}] Error eliminando ${file}:`, err);
+                }
+              });
+            }
+          }
+          
+        } catch (err) {
+          console.error(`[Usuario ${userId}] Error eliminando sesión:`, err);
+        }
+        
+        // Esperar un poco antes de reinicializar para asegurar que se genere QR
+        setTimeout(() => {
+          console.log(`🔄 [Usuario ${userId}] Reinicializando WhatsApp después de limpiar sesión...`);
+          initializeWhatsApp(userId);
+        }, 5000); // Aumentar tiempo de espera para asegurar limpieza completa
+      } else if (isRestartRequired) {
+        // Para "restart required" sin conflicto, solo reconectar (no limpiar sesión)
+        console.log(`🔄 [Usuario ${userId}] Reinicio requerido detectado (sin conflicto). Reconectando sin limpiar sesión...`);
+        userData.currentQR = null;
+        setTimeout(() => {
+          console.log(`🔄 [Usuario ${userId}] Reinicializando WhatsApp...`);
+          initializeWhatsApp(userId);
+        }, 8000); // Esperar más tiempo para evitar errores 428
+      } else if (shouldReconnect) {
+        userData.currentQR = null;
+        console.log(`🔄 [Usuario ${userId}] Intentando reconectar...`);
+        // Para errores 428, esperar más tiempo antes de reconectar
+        const waitTime = statusCode === 428 ? 15000 : 5000;
+        setTimeout(() => {
+          initializeWhatsApp(userId);
+        }, waitTime);
+      } else {
+        userData.currentQR = null;
+        console.log(`⚠️ [Usuario ${userId}] No se puede reconectar. Usa /api/force-qr para generar un nuevo QR.`);
+      }
+    } else if (connection === 'open') {
+      console.log(`✅ [Usuario ${userId}] ¡Cliente de WhatsApp listo!`);
+      console.log(`✅ [Usuario ${userId}] Conexión establecida correctamente`);
+      userData.isReady = true;
+      userData.currentQR = null;
+      
+      // ✅ CRÍTICO: NO actualizar la BD automáticamente aquí
+      // La actualización SOLO debe ocurrir cuando el usuario explícitamente llama a /api/link-phone
+      // Este evento solo actualiza las variables locales del usuario
+      try {
+        // Intentar obtener el ID de WhatsApp desde el socket
+        const fullId = userData.socket.user?.id || null;
+        if (fullId) {
+          console.log(`📱 [Usuario ${userId}] socket.user.id completo:`, fullId);
+          
+          // Extraer whatsapp_id (sin sufijo) desde socket.user.id
+          const whatsappId = fullId.split(':')[0].split('@')[0];
+          userData.whatsappId = whatsappId;
+          
+          console.log(`📱 [Usuario ${userId}] ID WhatsApp extraído (whatsapp_id): ${whatsappId}`);
+          console.log(`⚠️  [Usuario ${userId}] NO se actualiza la BD automáticamente. La actualización solo ocurre cuando el usuario llama a /api/link-phone`);
+          console.log(`💡 [Usuario ${userId}] El usuario ${userId} debe llamar a /api/link-phone para vincular este WhatsApp`);
+        } else {
+          console.warn(`⚠️ [Usuario ${userId}] No se pudo obtener el ID de WhatsApp desde socket.user`);
+          userData.whatsappId = null;
+          userData.whatsappNumber = null;
+        }
+      } catch (err) {
+        console.error(`❌ [Usuario ${userId}] Error procesando conexión:`, err);
+        userData.whatsappId = null;
+        userData.whatsappNumber = null;
+      }
+    } else if (connection === 'connecting') {
+      console.log(`🔄 [Usuario ${userId}] Conectando...`);
+      // Si está conectando pero no hay QR y no está listo después de un tiempo, puede necesitar forzar QR
+      setTimeout(() => {
+        if (!userData.isReady && !userData.currentQR && connection === 'connecting') {
+          console.log(`⚠️ [Usuario ${userId}] Conexión tardando mucho. Si no se conecta, puede necesitar nuevo QR.`);
+        }
+      }, 10000); // 10 segundos
+    }
+  });
+
+  // ✅ REFACTORIZADO: Manejo de mensajes específico por usuario
+  console.log(`📡 [Usuario ${userId}] Registrando handler de mensajes (messages.upsert)...`);
+  socket.ev.on('messages.upsert', async (m) => {
+    console.log(`🔔 [Usuario ${userId}] ========== EVENTO MESSAGES.UPSERT RECIBIDO ==========`);
+    console.log(`🔔 [Usuario ${userId}] Cantidad de mensajes:`, m.messages?.length || 0);
+    console.log(`🔔 [Usuario ${userId}] Tipo de evento:`, m.type || 'unknown');
+    console.log(`🔔 [Usuario ${userId}] JSON completo del evento:`, JSON.stringify(m, null, 2));
+    const messages = m.messages;
+    
+    for (const msg of messages) {
+      // Ignorar mensajes propios
+      if (msg.key.fromMe) {
+        continue;
+      }
+
+      // Ignorar mensajes de grupos si está configurado
+      if (quivrConfig.ignoreGroups && msg.key.remoteJid?.includes('@g.us')) {
+        continue;
+      }
+
+      // Solo procesar mensajes con texto
+      if (!msg.message || (!msg.message.conversation && !msg.message.extendedTextMessage)) {
+        continue;
+      }
+
+      const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+      const from = msg.key.remoteJid;
+
+      if (!messageText || !from) {
+        continue;
+      }
+
+      console.log(`📨 [Usuario ${userId}] ========== MENSAJE RECIBIDO ==========`);
+      console.log(`📨 [Usuario ${userId}] Mensaje recibido:`, messageText);
+      console.log(`👤 [Usuario ${userId}] De:`, from);
+      console.log(`📱 [Usuario ${userId}] Formato completo del remitente:`, from);
+      console.log(`⚙️ [Usuario ${userId}] Quivr habilitado:`, quivrConfig.enabled);
+      console.log(`🔑 [Usuario ${userId}] Message key:`, JSON.stringify(msg.key));
+      console.log(`📨 [Usuario ${userId}] =======================================`);
+
+      // Enviar a webhooks
+      for (const webhook of webhooks) {
+        try {
+          await axios.post(webhook.url, {
+            from: from,
+            body: messageText,
+            timestamp: msg.messageTimestamp,
+            isGroupMsg: from?.includes('@g.us') || false
+          }, {
+            headers: webhook.headers || {},
+            timeout: 10000
+          });
+        } catch (error) {
+          console.error(`Error enviando webhook a ${webhook.url}:`, error.message);
+        }
+      }
+
+      // ✅ REFACTORIZADO: Si Quivr está habilitado, procesar mensaje con aislamiento por usuario
+      // El mensaje llegó al socket del usuario ${userId}, así que el procesamiento es para ese usuario
+      if (quivrConfig.enabled && messageText.trim().length > 0) {
+        console.log(`📨 [Usuario ${userId}] Procesando mensaje con aislamiento por usuario`);
+        console.log(`📱 [Usuario ${userId}] Número de teléfono del remitente:`, from);
+
+        try {
+          // PASO 1: Identificar user_id desde número de teléfono del remitente
+          // SEGURIDAD: Solo buscar por el número del remitente, sin fallbacks
+          // Esto asegura que solo respondemos a números explícitamente vinculados
+          let userId = await getUserFromPhoneNumber(from);
+          
+          // Si no se encuentra con el formato exacto, intentar con número normalizado
+          // pero solo variantes del mismo número del remitente
+          if (!userId) {
+            const normalizedFrom = normalizePhoneNumber(from);
+            if (normalizedFrom && normalizedFrom !== from) {
+              console.log('🔄 Intentando con número normalizado del remitente:', normalizedFrom);
+              // Buscar por variantes del número del remitente (sin sufijos, con diferentes sufijos)
+              const db = getDb();
+              const normalizedWithSuffix = `${normalizedFrom}@s.whatsapp.net`;
+              
+              userId = await new Promise((resolve) => {
+                // Buscar solo variantes del número del remitente
+                const searchTerms = [
+                  normalizedWithSuffix,
+                  normalizedFrom,
+                  from
+                ];
+                
+                // Buscar primero en users.whatsapp_id (más directo)
+                db.get(
+                  `SELECT id FROM users 
+                   WHERE whatsapp_id IN (${searchTerms.map(() => '?').join(',')})
+                   OR whatsapp_id LIKE ?
+                   OR whatsapp_id LIKE ?`,
+                  [...searchTerms, `${normalizedFrom}@%`, `%${normalizedFrom}%`],
+                  (err, userRow) => {
+                    if (err || !userRow) {
+                      // Si no encuentra en users, buscar en whatsapp_sessions
+                      const placeholders = searchTerms.map(() => '?').join(',');
+                      db.get(
+                        `SELECT user_id FROM whatsapp_sessions 
+                         WHERE phone_number IN (${placeholders})
+                         OR phone_number LIKE ?
+                         OR phone_number LIKE ?`,
+                        [...searchTerms, `${normalizedFrom}@%`, `%${normalizedFrom}%`],
+                        (err2, row) => {
+                          db.close();
+                          if (err2 || !row) {
+                            resolve(null);
+                          } else {
+                            console.log(`✅ Usuario encontrado por búsqueda normalizada: ${row.user_id}`);
+                            resolve(row.user_id);
+                          }
+                        }
+                      );
+                    } else {
+                      db.close();
+                      console.log(`✅ Usuario encontrado en users.whatsapp_id: ${userRow.id}`);
+                      resolve(userRow.id);
+                    }
+                  }
+                );
+              });
+            }
+          }
+          
+          // SEGURIDAD: Si no se encuentra el usuario, NO responder (aislamiento estricto)
+          // No usar fallbacks al número conectado - solo responder a números explícitamente vinculados
+          if (!userId) {
+            console.error('❌ No se encontró usuario asociado al número del remitente:', from);
+            console.error('⚠️ El número debe estar explícitamente vinculado a un usuario');
+            console.error('💡 El número del remitente debe coincidir con users.whatsapp_number o whatsapp_sessions.phone_number');
+            console.error('💡 Sugerencia: Vincula el número desde el frontend cuando conectes WhatsApp');
+            // NO responder si no hay usuario asociado (aislamiento estricto - sin fallbacks)
+            continue;
+          }
+          
+          console.log('✅ Usuario identificado:', userId);
+
+          // PASO 2: Obtener token del usuario
+          const userToken = await getUserToken(userId);
+          
+          if (!userToken) {
+            console.error('❌ No se encontró token para el usuario:', userId);
+            // NO responder si no hay token (aislamiento estricto)
+            continue;
+          }
+          
+          console.log('✅ Token obtenido para usuario:', userId);
+
+          // PASO 2.5: Obtener número de WhatsApp real del usuario (solo dígitos)
+          const realPhoneNumber = await getUserRealPhoneNumber(userId);
+          console.log('📱 Número real de WhatsApp del usuario:', realPhoneNumber || 'No encontrado');
+
+          // PASO 2.6: Obtener ID de WhatsApp del usuario (sin sufijo)
+          const db = getDb();
+          const whatsappId = await new Promise((resolve) => {
+            db.get('SELECT whatsapp_id FROM users WHERE id = ?', [userId], (err, row) => {
+              db.close();
+              if (err || !row || !row.whatsapp_id) {
+                // Si no hay en users, intentar normalizar desde 'from'
+                const normalizedFrom = normalizePhoneNumber(from);
+                resolve(normalizedFrom || null);
+              } else {
+                // whatsapp_id es el ID de WhatsApp sin sufijo
+                resolve(row.whatsapp_id);
+              }
+            });
+          });
+          console.log('📱 ID de WhatsApp del usuario:', whatsappId || 'No encontrado');
+
+          // PASO 3: Obtener o crear conversación de WhatsApp
+          const conversationId = await getOrCreateWhatsAppConversation(userId, from);
+          console.log('✅ Conversación:', conversationId);
+
+          // PASO 4: Guardar mensaje del usuario en BD
+          // IMPORTANTE: Guardar tanto el ID de WhatsApp como el número real
+          await saveMessage(conversationId, userId, 'user', messageText, realPhoneNumber || null, whatsappId || null);
+          console.log(`✅ Mensaje del usuario guardado - WhatsApp ID: ${whatsappId || 'NULL'}, Número: ${realPhoneNumber || 'NULL'}`);
+
+          // PASO 5: Consultar Quivr con contexto del usuario
+          console.log('🔍 Consultando Quivr con contexto del usuario:', userId);
+          let answer = null;
+          
+          try {
+            answer = await queryQuivr(messageText, userToken, conversationId);
+            console.log('✅ Respuesta obtenida de Quivr');
+          } catch (quivrError) {
+            console.error('❌ Error consultando Quivr:', quivrError.message);
+            // NO usar fallback - lanzar error
+            answer = `Lo siento, ocurrió un error al procesar tu mensaje. Por favor, intenta de nuevo.`;
+            // Guardar error en BD también - usar número real del usuario y ID de WhatsApp
+            await saveMessage(conversationId, userId, 'assistant', answer, realPhoneNumber || null, whatsappId || null).catch(err => {
+              console.error('Error guardando mensaje de error:', err);
+            });
+          }
+
+          // PASO 6: Guardar respuesta del asistente en BD y auditoría
+          // IMPORTANTE: Guardar tanto el ID de WhatsApp como el número real
+          if (answer) {
+            await saveMessage(conversationId, userId, 'assistant', answer, realPhoneNumber || null, whatsappId || null);
+            console.log('✅ Respuesta del asistente guardada');
+          }
+
+          // PASO 7: Enviar respuesta por WhatsApp
+          if (answer && from) {
+            try {
+              // IMPORTANTE: Usar el número del remitente (from) directamente para responder
+              // El 'from' ya contiene el número correcto del remitente que envió el mensaje
+              // Necesitamos extraer el número y formatearlo correctamente para enviar
+              let chatId = null;
+              
+              // PRIORIDAD 1: Usar el número del remitente (from) directamente
+              // Extraer el número del formato que viene (puede ser @lid, @s.whatsapp.net, etc.)
+              let numberPart = from;
+              
+              // Si tiene formato con @, extraer solo la parte numérica
+              if (from.includes('@')) {
+                numberPart = from.split('@')[0];
+              }
+              
+              // Si tiene formato con :, extraer solo la parte numérica antes del :
+              if (numberPart.includes(':')) {
+                numberPart = numberPart.split(':')[0];
+              }
+              
+              // Formatear para enviar: número + @s.whatsapp.net
+              chatId = `${numberPart}@s.whatsapp.net`;
+              
+              console.log(`📤 Número de destino extraído del remitente: ${numberPart}`);
+              console.log(`📤 ChatId formateado para enviar: ${chatId}`);
+              console.log(`📤 Formato original del remitente (from): ${from}`);
+              console.log(`📤 whatsapp_number del usuario conectado: ${realPhoneNumber || 'No disponible'}`);
+              console.log(`📤 whatsapp_id del usuario conectado: ${whatsappId || 'No disponible'}`);
+              console.log('📝 Contenido:', answer.substring(0, 50) + '...');
+              console.log('📏 Longitud de respuesta:', answer.length);
+
+              // ✅ REFACTORIZADO: Usar socket del usuario que recibió el mensaje
+              // El mensaje llegó al socket del usuario que tiene este WhatsApp vinculado
+              // Necesitamos encontrar qué usuario tiene este socket
+              let userSocket = null;
+              for (const [uid, userData] of userSockets.entries()) {
+                if (userData.socket && userData.socket.user && userData.socket.user.id) {
+                  const socketWhatsappId = userData.socket.user.id.split(':')[0].split('@')[0];
+                  if (socketWhatsappId === whatsappId) {
+                    userSocket = userData.socket;
+                    break;
+                  }
+                }
+              }
+              
+              if (!userSocket) {
+                console.error(`❌ No se encontró socket para whatsapp_id: ${whatsappId}`);
+                throw new Error('Socket no encontrado para este WhatsApp');
+              }
+              
+              // Verificar que el socket esté listo antes de enviar
+              const userDataForSocket = Array.from(userSockets.values()).find(ud => ud.socket === userSocket);
+              if (!userDataForSocket || !userDataForSocket.isReady) {
+                console.error('❌ Socket no está listo para enviar mensajes');
+                throw new Error('Socket no está listo');
+              }
+
+              await userSocket.sendMessage(chatId, { text: answer });
+              console.log('✅ Mensaje enviado exitosamente a:', chatId);
+            } catch (sendError) {
+              console.error('❌ Error al enviar mensaje:', sendError.message);
+              console.error('❌ Detalles del error:', sendError);
+              console.error('❌ Formato original (from):', from);
+              console.error('❌ ChatId usado:', chatId || 'N/A');
+              console.error('❌ whatsapp_id del usuario:', whatsappId || 'No disponible');
+              console.error('❌ whatsapp_number del usuario:', realPhoneNumber || 'No disponible');
+              
+              // Intentar con formato alternativo si falla
+              if (sendError.message.includes('No sessions') || sendError.message.includes('session')) {
+                try {
+                  // Encontrar socket del usuario nuevamente
+                  let userSocket = null;
+                  for (const [uid, userData] of userSockets.entries()) {
+                    if (userData.socket && userData.socket.user && userData.socket.user.id) {
+                      const socketWhatsappId = userData.socket.user.id.split(':')[0].split('@')[0];
+                      if (socketWhatsappId === whatsappId) {
+                        userSocket = userData.socket;
+                        break;
+                      }
+                    }
+                  }
+                  
+                  if (userSocket) {
+                    // Extraer solo el número (sin sufijos)
+                    const numberPart = from.split('@')[0].split(':')[0];
+                    const alternativeChatId = `${numberPart}@s.whatsapp.net`;
+                    console.log(`🔄 Reintentando con formato alternativo (solo número): ${alternativeChatId}`);
+                    await userSocket.sendMessage(alternativeChatId, { text: answer });
+                    console.log('✅ Mensaje enviado exitosamente con formato alternativo');
+                  }
+                } catch (retryError) {
+                  console.error('❌ Error en reintento:', retryError.message);
+                  console.error('❌ Esto puede indicar que el número no está en la lista de contactos o hay un problema de sesión');
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error('❌ Error en el procesamiento del mensaje:', error);
+          console.error('❌ Stack:', error.stack);
+          // NO responder si hay error (aislamiento estricto - no fallback)
+        }
+      }
+    }
+  });
+}
+
+// ==================== RUTAS API ====================
+
+// ✅ REFACTORIZADO: Estado del cliente por usuario autenticado
+app.get('/api/status', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    console.log(`📊 [Usuario ${userId}] Solicitud de estado`);
+    
+    // ✅ CRÍTICO: Obtener datos del usuario desde la base de datos y userSockets, NO variables globales
+    const db = getDb();
+    
+    // Buscar datos del usuario en la BD
+    db.get(
+      'SELECT whatsapp_id, whatsapp_number FROM users WHERE id = ?',
+      [userId],
+      (err, userRow) => {
+        db.close();
+        
+        if (err) {
+          console.error(`❌ [Usuario ${userId}] Error obteniendo estado:`, err);
+          return res.status(500).json({ error: 'Error al obtener estado' });
+        }
+        
+        // ✅ CRÍTICO: Obtener datos del socket del usuario desde userSockets, NO variables globales
+        const userData = userSockets.get(userId);
+        
+        let status = {
+          ready: userData ? userData.isReady : false,
+          connected: userData && userData.socket ? true : false,
+          whatsapp_id: userRow ? userRow.whatsapp_id : null,
+          whatsapp_number: userRow ? userRow.whatsapp_number : null
+        };
+        
+        console.log(`📊 [Usuario ${userId}] Estado:`, status);
+        res.json(status);
+      }
+    );
+  } catch (error) {
+    console.error('Error en /api/status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ REFACTORIZADO: Enviar mensaje usando socket del usuario autenticado
+app.post('/api/send-message', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    const { number, message } = req.body;
+
+    if (!number || !message) {
+      return res.status(400).json({ error: 'Se requieren number y message' });
+    }
+    
+    // Obtener socket del usuario
+    const userData = userSockets.get(userId);
+    if (!userData || !userData.socket || !userData.isReady) {
+      return res.status(503).json({ error: 'WhatsApp no está conectado para este usuario' });
+    }
+
+    try {
+      let chatId = number;
+      if (!chatId.includes('@')) {
+        chatId = `${chatId}@s.whatsapp.net`;
+      }
+
+      await userData.socket.sendMessage(chatId, { text: message });
+      
+      res.json({
+        success: true,
+        message: 'Mensaje enviado'
+      });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Obtener QR
+// ✅ REFACTORIZADO: Generar QR en el contexto del usuario autenticado
+app.get('/api/qr', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    console.log(`📱 [Usuario ${userId}] Solicitud de QR`);
+    
+    // Obtener datos del usuario
+    const userData = userSockets.get(userId);
+    
+    if (!userData) {
+      // Si no existe socket para este usuario, inicializarlo
+      console.log(`🔧 [Usuario ${userId}] No hay socket, inicializando...`);
+      await initializeWhatsApp(userId);
+      // Esperar un momento para que se genere el QR o se valide la sesión
+      await new Promise(resolve => setTimeout(resolve, 4000)); // Aumentar a 4s para dar tiempo a validación
+      const newUserData = userSockets.get(userId);
+      
+      // ✅ CRÍTICO: Verificar que si está listo, la sesión realmente pertenece a este usuario
+      if (newUserData && newUserData.isReady && newUserData.socket && newUserData.socket.user) {
+        const fullId = newUserData.socket.user.id;
+        const whatsappIdFromSession = fullId.split(':')[0].split('@')[0];
+        
+        // Validar que este whatsapp_id pertenece a este usuario (PROMESA para manejar asíncrono)
+        return new Promise((resolve) => {
+          const db = getDb();
+          db.get(
+            'SELECT id, whatsapp_id FROM users WHERE id = ? AND whatsapp_id = ?',
+            [userId, whatsappIdFromSession],
+            (err, userRow) => {
+              db.close();
+              
+              if (!err && userRow && userRow.id === userId && userRow.whatsapp_id === whatsappIdFromSession) {
+                // ✅ Sesión válida
+                resolve(res.json({ 
+                  qr: null, 
+                  ready: true,
+                  message: 'Ya está conectado' 
+                }));
+              } else {
+                // ❌ Sesión inválida - forzar nuevo QR
+                console.error(`❌ [Usuario ${userId}] Sesión restaurada NO pertenece a este usuario`);
+                if (newUserData.socket) {
+                  newUserData.socket.end();
+                  newUserData.socket = null;
+                }
+                userSockets.delete(userId);
+                // Limpiar sesión
+                const fs = require('fs');
+                const authDir = path.join(__dirname, 'baileys_auth', `user_${userId}`);
+                try {
+                  const credsPath = path.join(authDir, 'creds.json');
+                  if (fs.existsSync(credsPath)) {
+                    fs.unlinkSync(credsPath);
+                  }
+                } catch (cleanErr) {
+                  console.error(`[Usuario ${userId}] Error limpiando:`, cleanErr);
+                }
+                // Reinicializar para generar nuevo QR
+                setTimeout(async () => {
+                  await initializeWhatsApp(userId);
+                }, 1000);
+                resolve(res.json({ 
+                  qr: null, 
+                  ready: false,
+                  message: 'QR aún no disponible, esperando...' 
+                }));
+              }
+            }
+          );
+        });
+      }
+      
+      if (newUserData && newUserData.currentQR) {
+        return res.json({ 
+          qr: newUserData.currentQR, 
+          ready: false 
+        });
+      }
+      return res.json({ 
+        qr: null, 
+        ready: false,
+        message: 'QR aún no disponible, esperando...'
+      });
+    }
+    
+    // ✅ CRÍTICO: Validar que si está listo, la sesión realmente pertenece a este usuario
+    if (userData.isReady && userData.socket && userData.socket.user) {
+      const fullId = userData.socket.user.id;
+      const whatsappIdFromSession = fullId.split(':')[0].split('@')[0];
+      
+      // Validar que este whatsapp_id pertenece a este usuario
+      const db = getDb();
+      db.get(
+        'SELECT id, whatsapp_id FROM users WHERE id = ? AND whatsapp_id = ?',
+        [userId, whatsappIdFromSession],
+        (err, userRow) => {
+          db.close();
+          
+          if (!err && userRow && userRow.id === userId && userRow.whatsapp_id === whatsappIdFromSession) {
+            // ✅ Sesión válida
+            return res.json({ 
+              qr: null, 
+              ready: true,
+              message: 'Ya está conectado' 
+            });
+          } else {
+            // ❌ Sesión inválida - forzar nuevo QR
+            console.error(`❌ [Usuario ${userId}] Sesión NO pertenece a este usuario - forzando nuevo QR`);
+            if (userData.socket) {
+              userData.socket.end();
+              userData.socket = null;
+            }
+            userSockets.delete(userId);
+            // Limpiar sesión
+            const fs = require('fs');
+            const authDir = path.join(__dirname, 'baileys_auth', `user_${userId}`);
+            try {
+              const credsPath = path.join(authDir, 'creds.json');
+              if (fs.existsSync(credsPath)) {
+                fs.unlinkSync(credsPath);
+              }
+            } catch (cleanErr) {
+              console.error(`[Usuario ${userId}] Error limpiando:`, cleanErr);
+            }
+            // Reinicializar para generar nuevo QR
+            setTimeout(async () => {
+              await initializeWhatsApp(userId);
+            }, 1000);
+            return res.json({ 
+              qr: null, 
+              ready: false,
+              message: 'QR aún no disponible, esperando...' 
+            });
+          }
+        }
+      );
+      return; // La respuesta se enviará en el callback
+    }
+    
+    // Si hay QR disponible, retornarlo
+    if (userData.currentQR) {
+      return res.json({ 
+        qr: userData.currentQR, 
+        ready: false 
+      });
+    }
+    
+    // Si no hay QR y no está listo, retornar null (el frontend esperará)
+    res.json({ 
+      qr: null, 
+      ready: false,
+      message: 'QR aún no disponible, esperando...'
+    });
+  } catch (error) {
+    console.error('Error en /api/qr:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Registrar webhook
+app.post('/api/webhooks', (req, res) => {
+  const { url, headers } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: 'Se requiere la URL del webhook' });
+  }
+
+  const webhook = {
+    id: Date.now().toString(),
+    url,
+    headers: headers || {},
+    createdAt: new Date().toISOString()
+  };
+
+  webhooks.push(webhook);
+
+  res.json({
+    success: true,
+    webhook
+  });
+});
+
+// Listar webhooks
+app.get('/api/webhooks', (req, res) => {
+  res.json({
+    webhooks: webhooks.map(w => ({
+      id: w.id,
+      url: w.url,
+      createdAt: w.createdAt
+    }))
+  });
+});
+
+// Eliminar webhook
+app.delete('/api/webhooks/:id', (req, res) => {
+  const { id } = req.params;
+  const index = webhooks.findIndex(w => w.id === id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Webhook no encontrado' });
+  }
+
+  webhooks.splice(index, 1);
+  res.json({ success: true, message: 'Webhook eliminado' });
+});
+
+// ✅ REFACTORIZADO: Obtener chats del usuario autenticado
+app.get('/api/chats', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    // ✅ CRÍTICO: Usar userData del usuario, NO variable global isReady
+    const userData = userSockets.get(userId);
+    if (!userData || !userData.socket || !userData.isReady) {
+      return res.status(503).json({ error: 'WhatsApp no está conectado para este usuario' });
+    }
+
+    res.json({
+      chats: [],
+      message: 'Endpoint de chats no disponible con Baileys en esta implementación'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ REFACTORIZADO: Desconectar socket del usuario autenticado
+app.post('/api/disconnect', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    const userData = userSockets.get(userId);
+    if (userData && userData.socket) {
+      await userData.socket.end(undefined);
+      userSockets.delete(userId);
+      console.log(`✅ [Usuario ${userId}] Desconectado exitosamente`);
+    }
+    res.json({ success: true, message: 'Desconectado exitosamente' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ REFACTORIZADO: Reiniciar conexión del usuario autenticado
+app.post('/api/reconnect', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    const userData = userSockets.get(userId);
+    if (userData && userData.socket) {
+      await userData.socket.end(undefined);
+    }
+    await initializeWhatsApp(userId);
+    res.json({ success: true, message: 'Reiniciando conexión...' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ✅ REFACTORIZADO: Forzar nuevo QR para el usuario autenticado
+app.post('/api/force-qr', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    console.log(`🔄 [Usuario ${userId}] Forzando generación de nuevo QR...`);
+    
+    // ✅ CRÍTICO: Cerrar socket del usuario específico, NO global
+    const userData = userSockets.get(userId);
+    if (userData && userData.socket) {
+      await userData.socket.end(undefined);
+      userSockets.delete(userId);
+    }
+    
+    // Limpiar sesión guardada para forzar nuevo QR
+    const fs = require('fs');
+    const authDir = path.join(__dirname, 'baileys_auth', `user_${userId}`);
+    
+    try {
+      // Eliminar creds.json para forzar nuevo QR
+      const credsPath = path.join(authDir, 'creds.json');
+      if (fs.existsSync(credsPath)) {
+        fs.unlinkSync(credsPath);
+        console.log(`✅ [Usuario ${userId}] Sesión anterior eliminada`);
+      }
+    } catch (err) {
+      console.error(`[Usuario ${userId}] Error limpiando sesión:`, err);
+    }
+    
+    // ✅ CRÍTICO: Reinicializar WhatsApp para este usuario específico (esto generará nuevo QR)
+    setTimeout(async () => {
+      await initializeWhatsApp(userId);
+    }, 1000);
+    
+    res.json({ 
+      success: true, 
+      message: 'Sesión limpiada. Se generará nuevo QR en unos segundos...' 
+    });
+  } catch (error) {
+    console.error('Error forzando QR:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== CONFIGURACIÓN QUIVR ====================
+
+// Obtener configuración de Quivr
+app.get('/api/quivr/config', (req, res) => {
+  res.json({
+    success: true,
+    config: {
+      enabled: quivrConfig.enabled,
+      url: quivrConfig.url,
+      endpoint: quivrConfig.endpoint,
+      ignoreGroups: quivrConfig.ignoreGroups,
+      chatId: quivrConfig.chatId
+    }
+  });
+});
+
+// Configurar Quivr
+app.post('/api/quivr/config', (req, res) => {
+  const { enabled, url, endpoint, ignoreGroups, chatId } = req.body;
+
+  if (enabled !== undefined) quivrConfig.enabled = Boolean(enabled);
+  if (url) quivrConfig.url = url;
+  if (endpoint !== undefined) quivrConfig.endpoint = endpoint;
+  if (ignoreGroups !== undefined) quivrConfig.ignoreGroups = Boolean(ignoreGroups);
+  if (chatId !== undefined) quivrConfig.chatId = chatId;
+
+  res.json({
+    success: true,
+    message: 'Configuración de Quivr actualizada',
+    config: quivrConfig
+  });
+});
+
+// Probar conexión con Quivr
+app.post('/api/quivr/test', async (req, res) => {
+  const { message } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: 'Se requiere un mensaje de prueba' });
+  }
+
+  try {
+    const response = await queryQuivr(message || 'Hola, esta es una prueba de conexión');
+    res.json({
+      success: true,
+      testMessage: message || 'Hola, esta es una prueba de conexión',
+      response: response,
+      config: {
+        url: quivrConfig.url,
+        endpoint: quivrConfig.endpoint
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Vincular número de WhatsApp a usuario (usa token de autenticación)
+app.post('/api/link-phone', async (req, res) => {
+  try {
+    // Obtener token de los headers
+    const authHeader = req.headers.authorization || req.headers['x-auth-token'];
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticación requerido' });
+    }
+    
+    // Obtener user_id desde el token
+    const userId = await getUserIdFromToken(token);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Token inválido o usuario no encontrado' });
+    }
+    
+    // ❌ CRÍTICO: Prevenir que usuarios admin vinculen WhatsApp
+    // Verificar el role del usuario antes de continuar
+    const dbCheckRole = getDb();
+    dbCheckRole.get(
+      'SELECT id, username, role FROM users WHERE id = ?',
+      [userId],
+      (errRole, userRow) => {
+        dbCheckRole.close();
+        if (errRole) {
+          console.error('❌ Error verificando role del usuario:', errRole);
+          return res.status(500).json({ error: 'Error al verificar permisos del usuario' });
+        }
+        
+        if (!userRow) {
+          return res.status(401).json({ error: 'Usuario no encontrado' });
+        }
+        
+        // ❌ BLOQUEAR ADMIN: No permitir que admin vincule WhatsApp
+        if (userRow.role === 'admin') {
+          console.error(`❌ BLOQUEADO: Usuario admin (ID: ${userId}, username: ${userRow.username}) intentó vincular WhatsApp`);
+          console.error(`❌ Los usuarios admin NO pueden vincular WhatsApp por seguridad`);
+          return res.status(403).json({ 
+            error: 'Los usuarios administradores no pueden vincular WhatsApp. Esta funcionalidad está reservada para usuarios regulares.' 
+          });
+        }
+        
+        // Continuar con el proceso de vinculación solo si NO es admin
+        continueLinkPhoneProcess(userId, req, res);
+      }
+    );
+  } catch (error) {
+    console.error('Error en /api/link-phone:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Función auxiliar para continuar el proceso de vinculación (separada para evitar anidación excesiva)
+function continueLinkPhoneProcess(userId, req, res) {
+  try {
+    // ✅ REFACTORIZADO: Obtener ID de WhatsApp desde el socket del usuario específico
+    // El formato de socket.user.id puede ser: "138916556447751:lid" o "138916556447751@s.whatsapp.net:something"
+    // IMPORTANTE: Según la lógica establecida:
+    // - whatsapp_id debe guardar el ID SIN sufijo (solo número, ej: 138916556447751)
+    // - whatsapp_number debe guardar el número real (solo dígitos, ej: 595972908588)
+    let whatsappIdFull = null; // ID completo con sufijo (ej: 138916556447751@lid o 138916556447751@s.whatsapp.net)
+    let whatsappIdNumber = null; // Solo el número del ID (ej: 138916556447751) - para búsquedas
+    
+    const userData = userSockets.get(userId);
+    if (!userData || !userData.socket) {
+      return res.status(400).json({ error: 'No hay conexión de WhatsApp activa para este usuario' });
+    }
+    
+    if (userData.socket && userData.socket.user && userData.socket.user.id) {
+      const fullId = userData.socket.user.id;
+      console.log(`🔍 socket.user.id completo: ${fullId}`);
+      
+      // Extraer el ID completo con sufijo para guardar en whatsapp_id
+      // El formato puede ser: "138916556447751:lid" o "595986782672:36@s.whatsapp.net"
+      // IMPORTANTE: Necesitamos preservar el formato completo con sufijo
+      // Si tiene formato "numero:lid", convertir a "numero@lid"
+      // Si tiene formato "numero:algo@s.whatsapp.net", extraer el número y usar formato "@lid"
+      
+      // Primero, intentar detectar si tiene formato ":lid" (formato más común para IDs de WhatsApp)
+      if (fullId.includes(':lid')) {
+        // Formato: "138916556447751:lid" -> convertir a "138916556447751@lid"
+        const numberPart = fullId.split(':')[0];
+        whatsappIdFull = `${numberPart}@lid`;
+      } else if (fullId.includes(':')) {
+        // Formato: "595986782672:36@s.whatsapp.net" o "numero:algo"
+        // Extraer solo el número (antes del primer ':') y usar formato @lid
+        const numberPart = fullId.split(':')[0];
+        whatsappIdFull = `${numberPart}@lid`;
+      } else if (fullId.includes('@')) {
+        // Formato: "595986782672@s.whatsapp.net"
+        // Extraer el número y convertir a formato @lid
+        const numberPart = fullId.split('@')[0];
+        whatsappIdFull = `${numberPart}@lid`;
+      } else {
+        // Solo número, agregar sufijo por defecto @lid
+        whatsappIdFull = `${fullId}@lid`;
+      }
+      
+      // Extraer solo el número (sin sufijo) para búsquedas y comparaciones
+      whatsappIdNumber = fullId.split(':')[0].split('@')[0];
+      
+      console.log(`✅ ID WhatsApp completo (con sufijo): ${whatsappIdFull}`);
+      console.log(`✅ ID WhatsApp (solo número): ${whatsappIdNumber}`);
+    }
+    
+    // Si se proporciona whatsappId en el body, usarlo (permite override)
+    if (req.body.whatsappId) {
+      whatsappIdFull = req.body.whatsappId;
+      whatsappIdNumber = req.body.whatsappId.split('@')[0].split(':')[0];
+      console.log(`✅ ID WhatsApp desde body (completo): ${whatsappIdFull}`);
+      console.log(`✅ ID WhatsApp desde body (solo número): ${whatsappIdNumber}`);
+    }
+    
+    console.log(`🔍 [Usuario ${userId}] /api/link-phone - whatsappIdNumber: ${whatsappIdNumber}`);
+    console.log(`🔍 [Usuario ${userId}] /api/link-phone - socket existe: ${!!userData.socket}, socket.user existe: ${!!(userData.socket && userData.socket.user)}`);
+    console.log(`🔍 [Usuario ${userId}] /api/link-phone - body recibido:`, JSON.stringify(req.body));
+    
+    if (!whatsappIdNumber) {
+      console.error('❌ /api/link-phone: No se pudo obtener el ID de WhatsApp desde el socket');
+      return res.status(400).json({ error: 'No se pudo obtener el ID de WhatsApp. Asegúrate de que WhatsApp esté conectado.' });
+    }
+    
+    // Obtener whatsapp_number desde el body (valor exacto que devuelve la API)
+    // IMPORTANTE: NO normalizar, NO transformar, guardar exactamente como viene
+    let whatsapp_number = req.body.phoneNumber || req.body.whatsapp_number;
+    
+    // Si no se proporciona whatsapp_number, verificar si el usuario ya tiene uno en la BD
+    // Esto permite actualizar solo whatsapp_id si whatsapp_number no está disponible
+    let whatsappNumberToSave = whatsapp_number;
+    if (!whatsappNumberToSave) {
+      console.log('⚠️  /api/link-phone: whatsapp_number no proporcionado, verificando si existe en BD...');
+      const dbCheck = getDb();
+      dbCheck.get(
+        'SELECT whatsapp_number FROM users WHERE id = ?',
+        [userId],
+        (err, userRow) => {
+          dbCheck.close();
+          if (!err && userRow && userRow.whatsapp_number) {
+            whatsappNumberToSave = userRow.whatsapp_number;
+            console.log(`✅ Usando whatsapp_number existente de BD: ${whatsappNumberToSave}`);
+          } else {
+            // Si no hay whatsapp_number en BD y no se proporciona, usar whatsappIdNumber como temporal
+            whatsappNumberToSave = whatsappIdNumber;
+            console.log(`⚠️  No hay whatsapp_number en BD, usando whatsapp_id como temporal: ${whatsappNumberToSave}`);
+            console.log(`💡 El whatsapp_number se puede actualizar más tarde proporcionándolo en el body`);
+          }
+        }
+      );
+    }
+    
+    // IMPORTANTE: Guardar exactamente el valor que viene (sin normalizar)
+    if (whatsapp_number) {
+      console.log(`✅ whatsapp_number recibido (valor exacto de la API): ${whatsapp_number}`);
+    } else {
+      console.log(`⚠️  whatsapp_number no proporcionado, se usará valor existente o temporal`);
+    }
+    
+    // Para whatsapp_sessions, usar el ID completo con sufijo (para compatibilidad)
+    // Usar whatsappIdFull si está disponible, sino construir desde whatsappIdNumber
+    const formattedNumberForSession = whatsappIdFull || `${whatsappIdNumber}@s.whatsapp.net`; // Para whatsapp_sessions
+    
+    const db = getDb();
+    
+    // Verificar si el número ya está vinculado a otro usuario y continuar con la actualización
+    db.get(
+      'SELECT user_id, phone_number FROM whatsapp_sessions WHERE phone_number = ?',
+      [formattedNumberForSession],
+      async (err, existingRow) => {
+        if (err) {
+          db.close();
+          console.error('Error verificando sesión existente:', err);
+          return res.status(500).json({ error: 'Error al verificar sesión existente' });
+        }
+        
+        if (existingRow) {
+          if (existingRow.user_id !== userId) {
+            // ❌ CRÍTICO: El WhatsApp ya está vinculado a OTRO usuario
+            // NO permitir re-vinculación automática - esto previene que un usuario "robe" el WhatsApp de otro
+            db.close();
+            console.error(`❌ ERROR: El número ${formattedNumberForSession} ya está vinculado al usuario ${existingRow.user_id}`);
+            console.error(`❌ El usuario ${userId} NO puede vincular este WhatsApp porque pertenece a otro usuario`);
+            return res.status(409).json({ 
+              error: `Este número de WhatsApp ya está vinculado a otro usuario. Solo el usuario que escaneó el QR puede vincular su WhatsApp.` 
+            });
+          } else {
+            // Ya está vinculado al mismo usuario, solo actualizar status y fecha
+            console.log(`ℹ️  El número ${formattedNumberForSession} ya está vinculado al usuario ${userId}, actualizando estado`);
+          }
+        }
+        
+        // Vincular o actualizar la sesión (INSERT OR REPLACE actualiza si existe)
+        db.run(
+          `INSERT OR REPLACE INTO whatsapp_sessions (user_id, phone_number, status, connected_at) 
+           VALUES (?, ?, 'connected', CURRENT_TIMESTAMP)`,
+          [userId, formattedNumberForSession],
+          function(insertErr) {
+            if (insertErr) {
+              db.close();
+              console.error('Error vinculando número en whatsapp_sessions:', insertErr);
+              return res.status(500).json({ error: 'Error al vincular número de teléfono' });
+            }
+            
+            console.log(`✅ Sesión de WhatsApp guardada/actualizada en whatsapp_sessions para usuario ${userId}`);
+            
+            // ACTUALIZAR también en la tabla users
+            // IMPORTANTE: Guardar exactamente los valores que devuelve la API
+            // - whatsapp_id: ID de WhatsApp SIN sufijo (ej: "138916556447751")
+            // - whatsapp_number: Número real del usuario (ej: "595972908588")
+            // NO normalizar, NO transformar, NO derivar uno del otro
+            // Persistir exactamente lo que devuelve la API
+            
+            // whatsapp_id: Extraer solo el número SIN sufijo desde socket.user.id
+            let whatsappIdToSave = whatsappIdNumber;
+            if (!whatsappIdToSave && formattedNumberForSession) {
+              whatsappIdToSave = formattedNumberForSession.split('@')[0].split(':')[0];
+            }
+            
+            // whatsapp_number: Obtener el valor (del body, BD existente, o temporal)
+            // Función para actualizar la tabla users
+            const updateUsersTable = (finalWhatsappNumber) => {
+              const whatsappNumberToUse = finalWhatsappNumber || whatsappIdNumber;
+              
+              console.log(`📝 Actualizando tabla users con valores EXACTOS de la API (sin normalizar):`);
+              console.log(`   - whatsapp_id: ${whatsappIdToSave}`);
+              console.log(`   - whatsapp_number: ${whatsappNumberToUse}`);
+              console.log(`   - userId: ${userId}`);
+              
+              // Verificar que tengamos valores válidos
+              if (!whatsappIdToSave) {
+                console.error('❌ No se pudo obtener whatsapp_id para actualizar users');
+                db.close();
+                return res.status(400).json({ error: 'No se pudo obtener el whatsapp_id para actualizar' });
+              }
+              
+              // ✅ VALIDACIÓN CRÍTICA 1:1: Verificar que este whatsapp_id NO esté ya asignado a OTRO usuario
+              // Esto previene que múltiples usuarios tengan el mismo WhatsApp
+              const dbCheck = getDb();
+              dbCheck.get(
+                'SELECT id, username FROM users WHERE whatsapp_id = ? AND id != ?',
+                [whatsappIdToSave, userId],
+                (checkErr, existingUser) => {
+                  dbCheck.close();
+                  
+                  if (checkErr) {
+                    console.error('❌ Error verificando whatsapp_id duplicado:', checkErr);
+                    db.close();
+                    return res.status(500).json({ error: 'Error al verificar duplicados' });
+                  }
+                  
+                  if (existingUser) {
+                    // ❌ CRÍTICO: Este whatsapp_id ya está asignado a OTRO usuario
+                    console.error(`❌ ERROR: El whatsapp_id ${whatsappIdToSave} ya está asignado al usuario ${existingUser.id} (${existingUser.username})`);
+                    console.error(`❌ El usuario ${userId} NO puede usar este WhatsApp porque pertenece a otro usuario`);
+                    db.close();
+                    return res.status(409).json({ 
+                      error: `Este número de WhatsApp ya está vinculado a otro usuario (${existingUser.username}). Cada usuario debe tener su propio dispositivo WhatsApp.` 
+                    });
+                  }
+                  
+                  // ✅ Validación pasada: este whatsapp_id no está asignado a otro usuario
+                  // Ahora podemos actualizar SOLO al usuario específico del token
+                  
+                  // Usar una nueva conexión de base de datos para el UPDATE
+                  // ✅ VALIDACIÓN PRINCIPAL: Solo actualizar al usuario específico que está haciendo la conexión
+                  // El WHERE id = ? garantiza que solo se actualice el usuario autenticado (userId del token)
+                  const db2 = getDb();
+                  db2.run(
+                    'UPDATE users SET whatsapp_id = ?, whatsapp_number = ? WHERE id = ?',
+                    [whatsappIdToSave, whatsappNumberToUse, userId],
+                    function(updateErr) {
+                      if (updateErr) {
+                        console.error('❌ Error actualizando whatsapp_number en users:', updateErr);
+                        console.error('❌ Detalles del error:', JSON.stringify(updateErr));
+                        db2.close();
+                        db.close();
+                        // No fallar si falla la actualización en users, pero loguear y responder
+                        const action = existingRow ? 'actualizado' : 'vinculado';
+                        return res.json({ 
+                          success: true, 
+                          message: `Número ${action} en sesión, pero hubo un error al actualizar la tabla users`,
+                          whatsapp_id: whatsappIdToSave,
+                          whatsapp_number: whatsappNumberToUse,
+                          userId: userId,
+                          wasLinked: !!existingRow,
+                          previousUserId: existingRow ? existingRow.user_id : null,
+                          warning: 'La sesión se guardó pero la tabla users no se actualizó',
+                          error: updateErr.message
+                        });
+                      }
+                      
+                      const rowsAffected = this.changes;
+                      console.log(`✅ UPDATE ejecutado - Filas afectadas: ${rowsAffected}`);
+                      console.log(`✅ Valores guardados EXACTAMENTE como devuelve la API (sin normalizar):`);
+                      console.log(`   - whatsapp_id: ${whatsappIdToSave}`);
+                      console.log(`   - whatsapp_number: ${whatsappNumberToUse}`);
+                      console.log(`   - Usuario: ${userId}`);
+                      
+                      // ✅ REFACTORIZADO: Actualizar variables locales del usuario (NO globales)
+                      const userDataUpdate = userSockets.get(userId);
+                      if (userDataUpdate) {
+                        userDataUpdate.whatsappId = whatsappIdToSave;
+                        userDataUpdate.whatsappNumber = whatsappNumberToUse;
+                      }
+                      
+                      // Verificar que se actualizó correctamente
+                      db2.get('SELECT whatsapp_id, whatsapp_number FROM users WHERE id = ?', [userId], (verifyErr, verifyRow) => {
+                        db2.close();
+                        db.close();
+                        if (verifyErr) {
+                          console.error('❌ Error verificando actualización:', verifyErr);
+                        } else if (verifyRow) {
+                          console.log(`✅ Verificación: Usuario ${userId} - whatsapp_id=${verifyRow.whatsapp_id}, whatsapp_number=${verifyRow.whatsapp_number}`);
+                          // ✅ CRÍTICO: Actualizar SOLO variables locales del usuario (NO globales)
+                          const userDataVerify = userSockets.get(userId);
+                          if (userDataVerify) {
+                            userDataVerify.whatsappId = verifyRow.whatsapp_id;
+                            userDataVerify.whatsappNumber = verifyRow.whatsapp_number;
+                          }
+                          // ❌ ELIMINADO: No actualizar variables globales connectedWhatsAppId/connectedWhatsAppNumber
+                        }
+                        
+                        const action = existingRow ? 'actualizado' : 'vinculado';
+                        console.log(`✅ Usuario ${userId} ${action} correctamente con valores EXACTOS de la API`);
+                        res.json({ 
+                          success: true, 
+                          message: `Usuario ${action} correctamente`,
+                          whatsapp_id: whatsappIdToSave,
+                          whatsapp_number: whatsappNumberToUse,
+                          userId: userId,
+                          wasLinked: !!existingRow,
+                          previousUserId: existingRow ? existingRow.user_id : null,
+                          rowsAffected: rowsAffected
+                        });
+                      });
+                    }
+                  ); // Cierre de db2.run
+                } // Cierre del callback de dbCheck.get (arrow function)
+            ); // Cierre de dbCheck.get
+            };
+            
+            // Obtener whatsapp_number: del body, BD existente, o temporal
+            if (whatsapp_number) {
+              // Si se proporcionó en el body, usarlo directamente
+              console.log(`✅ whatsapp_number recibido (valor exacto de la API): ${whatsapp_number}`);
+              updateUsersTable(whatsapp_number);
+            } else {
+              // Si no se proporcionó, buscar en BD
+              const dbCheck = getDb();
+              dbCheck.get(
+                'SELECT whatsapp_number FROM users WHERE id = ?',
+                [userId],
+                (err, userRow) => {
+                  dbCheck.close();
+                  if (!err && userRow && userRow.whatsapp_number) {
+                    console.log(`✅ Usando whatsapp_number existente de BD: ${userRow.whatsapp_number}`);
+                    updateUsersTable(userRow.whatsapp_number);
+                  } else {
+                    // Si no hay en BD, usar whatsappIdNumber como temporal
+                    console.log(`⚠️  No hay whatsapp_number en BD, usando whatsapp_id como temporal: ${whatsappIdNumber}`);
+                    console.log(`💡 El whatsapp_number se puede actualizar más tarde proporcionándolo en el body`);
+                    updateUsersTable(whatsappIdNumber);
+                  }
+                }
+              );
+            }
+          }
+        );
+      }
+    );
+  } catch (error) {
+    console.error('Error en continueLinkPhoneProcess:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+// Servir página principal
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ✅ REFACTORIZADO: Iniciar servidor sin inicializar WhatsApp global
+// Cada usuario inicializará su propia conexión cuando solicite el QR
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`Servidor API corriendo en http://0.0.0.0:${PORT}`);
+  console.log(`Accede desde tu navegador usando la IP del servidor: http://<IP_SERVIDOR>:${PORT}`);
+  console.log('✅ Sistema de WhatsApp por usuario activado');
+  console.log('💡 Cada usuario debe solicitar su QR en /api/qr para inicializar su conexión');
+});

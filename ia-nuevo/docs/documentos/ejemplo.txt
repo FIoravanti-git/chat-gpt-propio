@@ -1,0 +1,11 @@
+Este es un documento de ejemplo para Quivr.
+
+Quivr es una plataforma RAG (Retrieval-Augmented Generation) que permite integrar IA generativa en tus aplicaciones.
+
+Características principales:
+- Soporta múltiples modelos de lenguaje (OpenAI, Anthropic, Mistral)
+- Funciona con diferentes tipos de archivos (PDF, TXT, Markdown, DOCX)
+- Permite personalizar el flujo de recuperación de información
+- Es fácil de integrar en proyectos existentes
+
+Para usar Quivr, simplemente carga tus documentos en la carpeta de documentos y haz preguntas sobre ellos. El sistema utilizará RAG para encontrar información relevante y generar respuestas precisas.
