@@ -29,7 +29,7 @@ echo "[2/3] Backend IA / Quivr (ia-nuevo) -> :8000"
 PIDS+=($!)
 
 sleep 2
-echo "[3/3] WhatsApp API (whatsapp) -> :3000"
+echo "[3/3] WhatsApp API (whatsapp) -> :3001"
 (cd "$BASE/whatsapp" && npm start) &
 PIDS+=($!)
 
@@ -37,6 +37,6 @@ echo ""
 echo "Servicios en ejecución. Ctrl+C para detener todos."
 echo "  App:     http://localhost:5173"
 echo "  Quivr:   http://localhost:8000/docs"
-echo "  WhatsApp: http://localhost:3000"
+echo "  WhatsApp: http://localhost:3001"
 echo ""
 wait

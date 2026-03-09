@@ -13,6 +13,7 @@ interface User {
   whatsapp_number?: string | null
   created_at: string
   last_login: string | null
+  tipo_usuario?: 'Quivr/OpenAi' | 'OCR/OpenAi'
 }
 
 interface UserManagementProps {
@@ -32,7 +33,8 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
     username: '',
     password: '',
     role: 'user' as 'admin' | 'user',
-    openai_api_key: ''
+    openai_api_key: '',
+    tipo_usuario: 'Quivr/OpenAi' as 'Quivr/OpenAi' | 'OCR/OpenAi'
   })
   const [showApiKeys, setShowApiKeys] = useState<{ [key: number]: boolean }>({})
   const [whatsappStatus, setWhatsappStatus] = useState<{ connected: boolean; whatsapp_number: string | null; whatsapp_id: string | null }>({ connected: false, whatsapp_number: null, whatsapp_id: null })
@@ -42,7 +44,7 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
 
   const checkWhatsAppConnectionStatus = async () => {
     try {
-      const WHATSAPP_API = import.meta.env.DEV ? '/api/whatsapp' : 'http://31.220.102.254:3000'
+      const WHATSAPP_API = import.meta.env.DEV ? '/api/whatsapp' : 'http://31.220.102.254:3001'
       const response = await fetch(`${WHATSAPP_API}/api/status`, {
         method: 'GET'
       })
@@ -66,7 +68,7 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
   const checkAllUsersConnectionStatus = async () => {
     try {
       const token = localStorage.getItem('authToken')
-      const WHATSAPP_API = import.meta.env.DEV ? '/api/whatsapp' : 'http://31.220.102.254:3000'
+      const WHATSAPP_API = import.meta.env.DEV ? '/api/whatsapp' : 'http://31.220.102.254:3001'
       const response = await fetch(`${WHATSAPP_API}/api/status/all`, {
         method: 'GET',
         headers: {
@@ -156,7 +158,13 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
           'Authorization': `Bearer ${token}`,
           'x-auth-token': token || ''
         },
-        body: JSON.stringify(formData)
+        body: JSON.stringify({
+          username: formData.username,
+          password: formData.password,
+          role: formData.role,
+          openai_api_key: formData.openai_api_key || null,
+          tipo_usuario: formData.tipo_usuario || 'Quivr/OpenAi'
+        })
       })
 
       const data = await response.json()
@@ -164,7 +172,7 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
       if (response.ok) {
         alert('Usuario creado exitosamente')
         setShowAddModal(false)
-        setFormData({ username: '', password: '', role: 'user', openai_api_key: '' })
+        setFormData({ username: '', password: '', role: 'user', openai_api_key: '', tipo_usuario: 'Quivr/OpenAi' })
         loadUsers()
       } else {
         alert(data.error || 'Error al crear usuario')
@@ -184,14 +192,16 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
         ? `/api/auth/users/${editingUser.id}` 
         : `${AUTH_API}/api/auth/users/${editingUser.id}`
       
-      const updateData: any = { 
-        username: formData.username, 
-        role: formData.role,
-        openai_api_key: formData.openai_api_key.trim() === '' ? null : formData.openai_api_key.trim()
-      }
-      if (formData.password && formData.password.trim() !== '') {
-        updateData.password = formData.password
-      }
+  const updateData: Record<string, unknown> = {
+    username: formData.username,
+    role: formData.role,
+    openai_api_key: formData.openai_api_key.trim() === '' ? null : formData.openai_api_key.trim(),
+    tipo_usuario: formData.tipo_usuario === 'OCR/OpenAi' ? 'OCR/OpenAi' : 'Quivr/OpenAi',
+    tipoUsuario: formData.tipo_usuario === 'OCR/OpenAi' ? 'OCR/OpenAi' : 'Quivr/OpenAi'
+  }
+  if (formData.password && formData.password.trim() !== '') {
+    updateData.password = formData.password
+  }
 
       const response = await fetch(url, {
         method: 'PUT',
@@ -209,7 +219,7 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
         alert('Usuario actualizado exitosamente')
         setShowEditModal(false)
         setEditingUser(null)
-        setFormData({ username: '', password: '', role: 'user', openai_api_key: '' })
+        setFormData({ username: '', password: '', role: 'user', openai_api_key: '', tipo_usuario: 'Quivr/OpenAi' })
         loadUsers()
       } else {
         alert(data.error || 'Error al actualizar usuario')
@@ -297,7 +307,8 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
       username: user.username,
       password: '',
       role: user.role,
-      openai_api_key: user.openai_api_key || ''
+      openai_api_key: user.openai_api_key || '',
+      tipo_usuario: user.tipo_usuario || 'Quivr/OpenAi'
     })
     setShowEditModal(true)
   }
@@ -386,6 +397,7 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                     <th>ID</th>
                     <th>Usuario</th>
                     <th>Rol</th>
+                    <th>Tipo</th>
                     <th>ID Whatsapp</th>
                     <th>Número WhatsApp</th>
                     <th>Token</th>
@@ -398,7 +410,7 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                 <tbody>
                   {users.length === 0 ? (
                     <tr>
-                      <td colSpan={10} className="empty-state">
+                      <td colSpan={11} className="empty-state">
                         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                           <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                           <circle cx="9" cy="7" r="4"></circle>
@@ -435,6 +447,11 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                             )}
                           </span>
                         </td>
+                        <td className="tipo-usuario-cell">
+                          <span className={`tipo-badge ${user.tipo_usuario === 'OCR/OpenAi' ? 'ocr' : 'quivr'}`}>
+                            {user.tipo_usuario || 'Quivr/OpenAi'}
+                          </span>
+                        </td>
                         <td className="whatsapp-id-cell">
                           {user.whatsapp_id ? (
                             <div className="whatsapp-id-display" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -447,9 +464,9 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                                   height="20" 
                                   viewBox="0 0 24 24" 
                                   fill="#25D366"
-                                  title="Conectado"
                                   style={{ cursor: 'pointer' }}
                                 >
+                                  <title>Conectado</title>
                                   <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/>
                                 </svg>
                               ) : (
@@ -458,9 +475,9 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                                   height="20" 
                                   viewBox="0 0 24 24" 
                                   fill="#ef4444"
-                                  title="Desconectado"
                                   style={{ cursor: 'pointer' }}
                                 >
+                                  <title>Desconectado</title>
                                   <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/>
                                 </svg>
                               )}
@@ -491,9 +508,9 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                                   height="20" 
                                   viewBox="0 0 24 24" 
                                   fill="#25D366"
-                                  title="Conectado"
                                   style={{ cursor: 'pointer' }}
                                 >
+                                  <title>Conectado</title>
                                   <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/>
                                 </svg>
                               ) : (
@@ -502,9 +519,9 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                                   height="20" 
                                   viewBox="0 0 24 24" 
                                   fill="#ef4444"
-                                  title="Desconectado"
                                   style={{ cursor: 'pointer' }}
                                 >
+                                  <title>Desconectado</title>
                                   <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413Z"/>
                                 </svg>
                               )}
@@ -682,6 +699,16 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                   </select>
                 </div>
                 <div className="form-group">
+                  <label>Tipo de usuario</label>
+                  <select
+                    value={formData.tipo_usuario}
+                    onChange={(e) => setFormData({ ...formData, tipo_usuario: e.target.value as 'Quivr/OpenAi' | 'OCR/OpenAi' })}
+                  >
+                    <option value="Quivr/OpenAi">Quivr/OpenAi (Chat)</option>
+                    <option value="OCR/OpenAi">OCR/OpenAi (Comprobantes)</option>
+                  </select>
+                </div>
+                <div className="form-group">
                   <label>
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
@@ -781,6 +808,16 @@ export default function UserManagement({ isOpen, onClose }: UserManagementProps)
                   >
                     <option value="user">Usuario</option>
                     <option value="admin">Administrador</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Tipo de usuario</label>
+                  <select
+                    value={formData.tipo_usuario}
+                    onChange={(e) => setFormData({ ...formData, tipo_usuario: e.target.value as 'Quivr/OpenAi' | 'OCR/OpenAi' })}
+                  >
+                    <option value="Quivr/OpenAi">Quivr/OpenAi (Chat)</option>
+                    <option value="OCR/OpenAi">OCR/OpenAi (Comprobantes)</option>
                   </select>
                 </div>
                 <div className="form-group">

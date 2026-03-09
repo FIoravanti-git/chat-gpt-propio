@@ -5,7 +5,7 @@ if (typeof global.crypto === 'undefined') {
 }
 
 const express = require('express');
-const { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('baileys');
+const { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage } = require('baileys');
 const QRCode = require('qrcode');
 const axios = require('axios');
 const dotenv = require('dotenv');
@@ -14,13 +14,16 @@ const path = require('path');
 const pino = require('pino');
 const sqlite3 = require('sqlite3').verbose();
 
+const { processImageForComprobante } = require('./ocr-comprobante');
+const { getParaguayDateTime } = require('./timezone-paraguay');
+
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 const QUIVR_URL = process.env.QUIVR_URL || 'http://localhost:8000';
 
 // Archivo de log para poder ver actividad con: tail -f whatsapp/whatsapp.log
@@ -66,6 +69,18 @@ const userSockets = new Map(); // Map<userId, { socket, isReady, currentQR, what
 // Función helper para acceder a la base de datos
 function getDb() {
   return new sqlite3.Database(AUTH_DB_PATH);
+}
+
+/** Obtiene tipo_usuario del usuario: "Quivr/OpenAi" | "OCR/OpenAi" */
+function getUserTipoUsuario(userId) {
+  return new Promise((resolve) => {
+    const db = getDb();
+    db.get('SELECT tipo_usuario FROM users WHERE id = ?', [userId], (err, row) => {
+      db.close();
+      if (err || !row) return resolve('Quivr/OpenAi');
+      resolve((row.tipo_usuario && row.tipo_usuario.trim()) || 'Quivr/OpenAi');
+    });
+  });
 }
 
 // Normalizar número de teléfono para búsqueda consistente
@@ -557,83 +572,57 @@ async function initializeWhatsApp(userId) {
       const fullId = userDataCheck.socket.user.id;
       const whatsappIdFromSession = fullId.split(':')[0].split('@')[0];
       
-      // ✅ VALIDACIÓN ESTRICTA: Verificar que este whatsapp_id pertenece realmente a este usuario
+      // ✅ Validar que este whatsapp_id pertenece a este usuario, o asignarlo si es la primera vez
       const db = getDb();
       db.get(
-        'SELECT id, whatsapp_id FROM users WHERE id = ? AND whatsapp_id = ?',
-        [userId, whatsappIdFromSession],
+        'SELECT id, whatsapp_id FROM users WHERE id = ?',
+        [userId],
         (err, userRow) => {
           db.close();
           
           if (err) {
             console.error(`❌ [Usuario ${userId}] Error validando sesión restaurada:`, err);
-            // Si hay error, destruir sesión y forzar nuevo QR
             destroyInvalidSession(userId);
             return;
           }
           
-          if (userRow && userRow.id === userId && userRow.whatsapp_id === whatsappIdFromSession) {
-            // ✅ Sesión válida: pertenece a este usuario
+          const belongsToUser = userRow && userRow.whatsapp_id === whatsappIdFromSession;
+          if (belongsToUser) {
+            // ✅ Sesión válida: ya vinculada a este usuario
             console.log(`✅ [Usuario ${userId}] Sesión restaurada válida - pertenece a este usuario`);
             userDataCheck.isReady = true;
             userDataCheck.currentQR = null;
             userDataCheck.whatsappId = whatsappIdFromSession;
-            
-            // ✅ ACTUALIZAR estado de conexión en whatsapp_sessions cuando se restaura automáticamente
-            // Esto asegura que el estado se mantenga como 'connected' entre sesiones
+            updateWhatsAppSessionsOnRestore(userId, whatsappIdFromSession);
+            return;
+          }
+          
+          // Primera vez tras escanear: users.whatsapp_id aún no está; asignar y aceptar sesión
+          if (userRow && (userRow.whatsapp_id == null || userRow.whatsapp_id === '')) {
             const db2 = getDb();
-            const formattedNumberForSession = `${whatsappIdFromSession}@s.whatsapp.net`;
-            
-            db2.get(
-              'SELECT id FROM whatsapp_sessions WHERE user_id = ?',
-              [userId],
-              (err2, sessionRow) => {
-                if (err2) {
-                  db2.close();
-                  console.error(`❌ [Usuario ${userId}] Error verificando sesión en whatsapp_sessions:`, err2);
+            db2.run(
+              'UPDATE users SET whatsapp_id = ?, whatsapp_number = ? WHERE id = ?',
+              [whatsappIdFromSession, whatsappIdFromSession, userId],
+              function(updateErr) {
+                db2.close();
+                if (updateErr) {
+                  console.error(`❌ [Usuario ${userId}] Error asignando whatsapp_id en restauración:`, updateErr);
+                  destroyInvalidSession(userId);
                   return;
                 }
-                
-                if (sessionRow) {
-                  // Actualizar sesión existente con estado 'connected'
-                  db2.run(
-                    `UPDATE whatsapp_sessions 
-                     SET status = 'connected', connected_at = CURRENT_TIMESTAMP, phone_number = ?
-                     WHERE user_id = ?`,
-                    [formattedNumberForSession, userId],
-                    (updateErr) => {
-                      db2.close();
-                      if (updateErr) {
-                        console.error(`❌ [Usuario ${userId}] Error actualizando estado en whatsapp_sessions:`, updateErr);
-                      } else {
-                        console.log(`✅ [Usuario ${userId}] Estado de conexión actualizado en whatsapp_sessions: connected (sesión restaurada)`);
-                      }
-                    }
-                  );
-                } else {
-                  // Crear nueva sesión si no existe
-                  db2.run(
-                    `INSERT INTO whatsapp_sessions (user_id, phone_number, status, connected_at) 
-                     VALUES (?, ?, 'connected', CURRENT_TIMESTAMP)`,
-                    [userId, formattedNumberForSession],
-                    (insertErr) => {
-                      db2.close();
-                      if (insertErr) {
-                        console.error(`❌ [Usuario ${userId}] Error creando sesión en whatsapp_sessions:`, insertErr);
-                      } else {
-                        console.log(`✅ [Usuario ${userId}] Sesión creada en whatsapp_sessions: connected (sesión restaurada)`);
-                      }
-                    }
-                  );
-                }
+                console.log(`✅ [Usuario ${userId}] Sesión restaurada - whatsapp_id asignado por primera vez: ${whatsappIdFromSession}`);
+                userDataCheck.isReady = true;
+                userDataCheck.currentQR = null;
+                userDataCheck.whatsappId = whatsappIdFromSession;
+                updateWhatsAppSessionsOnRestore(userId, whatsappIdFromSession);
               }
             );
-          } else {
-            // ❌ CRÍTICO: Esta sesión NO pertenece a este usuario - destruir
-            console.error(`❌ [Usuario ${userId}] Sesión restaurada NO válida - whatsapp_id ${whatsappIdFromSession} no pertenece a este usuario`);
-            console.error(`❌ [Usuario ${userId}] Destruyendo sesión inválida y forzando nuevo QR`);
-            destroyInvalidSession(userId);
+            return;
           }
+          
+          // whatsapp_id asignado a otro usuario: invalidar sesión
+          console.error(`❌ [Usuario ${userId}] Sesión restaurada NO válida - whatsapp_id ${whatsappIdFromSession} no pertenece a este usuario`);
+          destroyInvalidSession(userId);
         }
       );
     }
@@ -837,7 +826,7 @@ async function initializeWhatsApp(userId) {
           const db = getDb();
           const formattedNumberForSession = `${whatsappId}@s.whatsapp.net`;
 
-          // Verificar si existe una sesión para este usuario
+          // 1) Actualizar o crear whatsapp_sessions
           db.get(
             'SELECT id FROM whatsapp_sessions WHERE user_id = ?',
             [userId],
@@ -848,12 +837,30 @@ async function initializeWhatsApp(userId) {
                 return;
               }
 
+              const runAfterSession = () => {
+                // 2) Actualizar users.whatsapp_id (y whatsapp_number con el mismo valor para que persista sesión y se vea en gestión)
+                // Así la sesión restaurada pasa la validación y no se pide QR de nuevo
+                const db2 = getDb();
+                db2.run(
+                  'UPDATE users SET whatsapp_id = ?, whatsapp_number = ? WHERE id = ?',
+                  [whatsappId, whatsappId, userId],
+                  function(updateUserErr) {
+                    db2.close();
+                    if (updateUserErr) {
+                      console.error(`❌ [Usuario ${userId}] Error actualizando users (whatsapp_id/whatsapp_number):`, updateUserErr);
+                    } else {
+                      console.log(`✅ [Usuario ${userId}] users actualizado - whatsapp_id: ${whatsappId}, whatsapp_number: ${whatsappId}`);
+                    }
+                  }
+                );
+              };
+
               if (sessionRow) {
                 db.run(
                   `UPDATE whatsapp_sessions 
-                   SET status = 'connected', connected_at = CURRENT_TIMESTAMP, phone_number = ?
+                   SET status = 'connected', connected_at = ?, phone_number = ?
                    WHERE user_id = ?`,
-                  [formattedNumberForSession, userId],
+                  [getParaguayDateTime(), formattedNumberForSession, userId],
                   function(updateErr) {
                     if (updateErr) {
                       console.error(`❌ [Usuario ${userId}] Error actualizando estado en whatsapp_sessions:`, updateErr);
@@ -861,13 +868,14 @@ async function initializeWhatsApp(userId) {
                       console.log(`✅ [Usuario ${userId}] Estado de conexión actualizado en whatsapp_sessions: connected`);
                     }
                     db.close();
+                    runAfterSession();
                   }
                 );
               } else {
                 db.run(
                   `INSERT INTO whatsapp_sessions (user_id, phone_number, status, connected_at) 
-                   VALUES (?, ?, 'connected', CURRENT_TIMESTAMP)`,
-                  [userId, formattedNumberForSession],
+                   VALUES (?, ?, 'connected', ?)`,
+                  [userId, formattedNumberForSession, getParaguayDateTime()],
                   function(insertErr) {
                     if (insertErr) {
                       console.error(`❌ [Usuario ${userId}] Error creando sesión en whatsapp_sessions:`, insertErr);
@@ -875,6 +883,7 @@ async function initializeWhatsApp(userId) {
                       console.log(`✅ [Usuario ${userId}] Nueva sesión creada en whatsapp_sessions: connected`);
                     }
                     db.close();
+                    runAfterSession();
                   }
                 );
               }
@@ -914,15 +923,54 @@ async function initializeWhatsApp(userId) {
         continue;
       }
 
+      const from = msg.key.remoteJid;
+      if (!from) continue;
+
+      // ---------- FLUJO OCR COMPROBANTES: imagen de usuario OCR/OpenAi ----------
+      if (msg.message && msg.message.imageMessage) {
+        const tipoUsuario = await getUserTipoUsuario(userId);
+        if (tipoUsuario === 'OCR/OpenAi') {
+          writeToLogFile(`[Usuario ${userId}] Imagen recibida (OCR/OpenAi) de ${from}`);
+          try {
+            const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: socket.updateMediaMessage });
+            if (!buffer || !Buffer.isBuffer(buffer)) {
+              throw new Error('No se pudo descargar la imagen');
+            }
+            const caption = (msg.message.imageMessage.caption || '').trim() || null;
+            const result = await processImageForComprobante(buffer, userId, caption);
+            const replyText = [
+              '✅ Comprobante registrado.',
+              `Fecha: ${result.fechaComprobante || '-'}`,
+              `Número: ${result.numeroComprobante || '-'}`,
+              `Importe: ${result.importe != null ? result.importe : '-'}`,
+              `Descripción: ${result.descripcion || '-'}`
+            ].join('\n');
+            const userData = userSockets.get(userId);
+            if (userData && userData.socket && userData.isReady) {
+              await userData.socket.sendMessage(from, { text: replyText });
+              writeToLogFile(`[Usuario ${userId}] Respuesta OCR enviada a ${from}`);
+            }
+          } catch (ocrErr) {
+            console.error('❌ Error OCR comprobante:', ocrErr.message);
+            writeToLogFile(`[Usuario ${userId}] Error OCR: ${ocrErr.message}`);
+            const userData = userSockets.get(userId);
+            const errorReply = 'No pude procesar la imagen como comprobante. Verifica que sea legible y que tengas configurada la API key de OpenAI.';
+            if (userData && userData.socket && userData.isReady) {
+              await userData.socket.sendMessage(from, { text: errorReply });
+            }
+          }
+          continue;
+        }
+      }
+
       // Solo procesar mensajes con texto
       if (!msg.message || (!msg.message.conversation && !msg.message.extendedTextMessage)) {
         continue;
       }
 
       const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-      const from = msg.key.remoteJid;
 
-      if (!messageText || !from) {
+      if (!messageText) {
         continue;
       }
 
@@ -1184,6 +1232,46 @@ function validateAndReturnStatus(userId, userData, res) {
       }
     }
   );
+}
+
+// ✅ Actualizar whatsapp_sessions al restaurar sesión (para no duplicar lógica)
+function updateWhatsAppSessionsOnRestore(userId, whatsappIdFromSession) {
+  const formattedNumberForSession = `${whatsappIdFromSession}@s.whatsapp.net`;
+  const db = getDb();
+  db.get('SELECT id FROM whatsapp_sessions WHERE user_id = ?', [userId], (err2, sessionRow) => {
+    if (err2) {
+      db.close();
+      console.error(`❌ [Usuario ${userId}] Error verificando sesión en whatsapp_sessions:`, err2);
+      return;
+    }
+    if (sessionRow) {
+      db.run(
+        `UPDATE whatsapp_sessions SET status = 'connected', connected_at = ?, phone_number = ? WHERE user_id = ?`,
+        [getParaguayDateTime(), formattedNumberForSession, userId],
+        (updateErr) => {
+          db.close();
+          if (updateErr) {
+            console.error(`❌ [Usuario ${userId}] Error actualizando estado en whatsapp_sessions:`, updateErr);
+          } else {
+            console.log(`✅ [Usuario ${userId}] Estado actualizado en whatsapp_sessions: connected (sesión restaurada)`);
+          }
+        }
+      );
+    } else {
+      db.run(
+        `INSERT INTO whatsapp_sessions (user_id, phone_number, status, connected_at) VALUES (?, ?, 'connected', ?)`,
+        [userId, formattedNumberForSession, getParaguayDateTime()],
+        (insertErr) => {
+          db.close();
+          if (insertErr) {
+            console.error(`❌ [Usuario ${userId}] Error creando sesión en whatsapp_sessions:`, insertErr);
+          } else {
+            console.log(`✅ [Usuario ${userId}] Sesión creada en whatsapp_sessions: connected (sesión restaurada)`);
+          }
+        }
+      );
+    }
+  });
 }
 
 // ✅ FUNCIÓN HELPER: Destruir sesión inválida
@@ -2291,8 +2379,8 @@ function continueLinkPhoneProcess(userId, req, res) {
         // Vincular o actualizar la sesión (INSERT OR REPLACE actualiza si existe)
         db.run(
           `INSERT OR REPLACE INTO whatsapp_sessions (user_id, phone_number, status, connected_at) 
-           VALUES (?, ?, 'connected', CURRENT_TIMESTAMP)`,
-          [userId, formattedNumberForSession],
+           VALUES (?, ?, 'connected', ?)`,
+          [userId, formattedNumberForSession, getParaguayDateTime()],
           function(insertErr) {
             if (insertErr) {
               db.close();

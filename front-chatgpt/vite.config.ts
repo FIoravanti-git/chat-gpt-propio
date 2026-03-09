@@ -8,9 +8,11 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
+    strictPort: true,
+    allowedHosts: ['ia.puntoguarani.com.py'],
     proxy: {
       '/api/whatsapp': {
-        target: 'http://31.220.102.254:3000',
+        target: 'http://31.220.102.254:3001',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/whatsapp/, '')
       },

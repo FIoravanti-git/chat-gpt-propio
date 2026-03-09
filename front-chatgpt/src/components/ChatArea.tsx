@@ -54,7 +54,7 @@ export default function ChatArea() {
 
     try {
       // Obtener respuesta de Quivr con conversation_id y channel
-      const response = await askQuivr(userMessage, conversationId, 'web')
+      const response = await askQuivr(userMessage, currentConversationId ? Number(currentConversationId) : undefined, 'web')
       
       // Agregar respuesta del asistente
       addMessage(conversationId, {
@@ -129,7 +129,7 @@ export default function ChatArea() {
           </>
         ) : (
           <div className="empty-chat">
-            <h2>Tabacman IA</h2>
+            <h2>NeuroChat</h2>
             <p>Escribe un mensaje para comenzar a chatear</p>
           </div>
         )}

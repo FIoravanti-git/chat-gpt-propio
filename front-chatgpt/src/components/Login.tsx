@@ -30,9 +30,9 @@ export default function Login() {
       <div className="login-box">
         <div className="login-header">
           <div className="logo-wrapper">
-            <img src="/Logo_tabacman.png" alt="Tabacman" className="login-logo" />
+            <img src="/Logo_tabacman.png" alt="NeuroChat" className="login-logo" />
           </div>
-          <h1>Tabacman IA</h1>
+          <h1>NeuroChat</h1>
           <p>Iniciar Sesión</p>
         </div>
         

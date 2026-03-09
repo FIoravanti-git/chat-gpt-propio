@@ -245,6 +245,34 @@
   box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3);
 }
 
+.tipo-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.tipo-badge.quivr {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.dark .tipo-badge.quivr {
+  background: #3730a3;
+  color: #e0e7ff;
+}
+
+.tipo-badge.ocr {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.dark .tipo-badge.ocr {
+  background: #065f46;
+  color: #d1fae5;
+}
+
 .token-cell,
 .api-key-cell,
 .whatsapp-cell,

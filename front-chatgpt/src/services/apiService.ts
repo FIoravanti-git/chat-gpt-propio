@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 // Usar proxy en desarrollo, URLs directas en producción
-const WHATSAPP_API = import.meta.env.DEV ? '/api/whatsapp' : 'http://31.220.102.254:3000'
+const WHATSAPP_API = import.meta.env.DEV ? '/api/whatsapp' : 'http://31.220.102.254:3001'
 const QUIVR_API = import.meta.env.DEV ? '/api/quivr' : 'http://31.220.102.254:8000'
 
 export async function getWhatsAppQR(): Promise<string> {

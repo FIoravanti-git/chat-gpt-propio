@@ -4,6 +4,7 @@ interface User {
   username: string
   token: string
   role: 'admin' | 'user'
+  tipo_usuario: 'Quivr/OpenAi' | 'OCR/OpenAi'
 }
 
 interface AuthContextType {
@@ -13,6 +14,7 @@ interface AuthContextType {
   isAuthenticated: boolean
   isLoading: boolean
   isAdmin: boolean
+  isOcrUser: boolean
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
@@ -28,19 +30,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const token = localStorage.getItem('authToken')
     const username = localStorage.getItem('username')
     const role = localStorage.getItem('userRole') as 'admin' | 'user' | null
+    const tipoUsuario = localStorage.getItem('tipoUsuario') as 'Quivr/OpenAi' | 'OCR/OpenAi' | null
     
     if (token && username) {
       // Verificar si el token es válido
       verifyToken(token)
         .then((userData) => {
           const userRole = userData.role || role || 'user'
-          setUser({ username, token, role: userRole as 'admin' | 'user' })
+          const tipo = userData.tipo_usuario || tipoUsuario || 'Quivr/OpenAi'
+          setUser({ username, token, role: userRole as 'admin' | 'user', tipo_usuario: (tipo === 'OCR/OpenAi' ? 'OCR/OpenAi' : 'Quivr/OpenAi') })
           localStorage.setItem('userRole', userRole)
+          localStorage.setItem('tipoUsuario', tipo)
         })
         .catch(() => {
           localStorage.removeItem('authToken')
           localStorage.removeItem('username')
           localStorage.removeItem('userRole')
+          localStorage.removeItem('tipoUsuario')
         })
         .finally(() => {
           setIsLoading(false)
@@ -50,7 +56,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  const verifyToken = async (token: string): Promise<{ role: string }> => {
+  const verifyToken = async (token: string): Promise<{ role: string; tipo_usuario: string }> => {
     const url = import.meta.env.DEV 
       ? '/api/auth/verify' 
       : `${AUTH_API}/api/auth/verify`
@@ -71,7 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const contentType = response.headers.get('content-type')
       if (contentType && contentType.includes('application/json')) {
         const data = await response.json()
-        return { role: data.role || 'user' }
+        return { role: data.role || 'user', tipo_usuario: data.tipo_usuario || 'Quivr/OpenAi' }
       }
       throw new Error('Respuesta inválida')
     } catch (error: any) {
@@ -114,12 +120,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const userData = { 
         username: data.username, 
         token: data.token,
-        role: data.role || 'user'
+        role: data.role || 'user',
+        tipo_usuario: data.tipo_usuario || 'Quivr/OpenAi'
       }
       setUser(userData)
       localStorage.setItem('authToken', data.token)
       localStorage.setItem('username', data.username)
       localStorage.setItem('userRole', userData.role)
+      localStorage.setItem('tipoUsuario', userData.tipo_usuario)
     } catch (error: any) {
       // Si es un error de red o parseo, lanzarlo con mensaje claro
       if (error instanceof TypeError && error.message.includes('fetch')) {
@@ -134,6 +142,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem('authToken')
     localStorage.removeItem('username')
     localStorage.removeItem('userRole')
+    localStorage.removeItem('tipoUsuario')
   }
 
   return (
@@ -144,7 +153,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         logout,
         isAuthenticated: !!user,
         isLoading,
-        isAdmin: user?.role === 'admin'
+        isAdmin: user?.role === 'admin',
+        isOcrUser: user?.tipo_usuario === 'OCR/OpenAi'
       }}
     >
       {children}

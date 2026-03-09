@@ -5,3 +5,36 @@
   overflow: hidden;
   position: relative;
 }
+
+.app.app-layout-ocr {
+  flex-direction: column;
+}
+
+.app-ocr-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+}
+
+.app-ocr-body .app-main {
+  flex: 1;
+}
+
+.app-ocr-body .right-panel {
+  flex-shrink: 0;
+}
+
+.app-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-main-ocr {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}

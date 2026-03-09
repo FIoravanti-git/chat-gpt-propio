@@ -1,0 +1,19 @@
+[Unit]
+Description=NeuroChat / Chat GPT Propio (frontend, auth, Quivr, WhatsApp)
+After=network.target
+
+[Service]
+Type=simple
+User=fioravanti
+Group=fioravanti
+WorkingDirectory=/opt/proyectos/chat-gpt-propio
+ExecStart=/opt/proyectos/chat-gpt-propio/start-all.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=neurochat
+
+[Install]
+WantedBy=multi-user.target

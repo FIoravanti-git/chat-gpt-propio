@@ -31,5 +31,5 @@ npm run build
 
 ## APIs
 
-- WhatsApp API: http://31.220.102.254:3000
+- WhatsApp API: http://31.220.102.254:3001
 - Quivr API: http://31.220.102.254:8000

@@ -6,6 +6,7 @@ import crypto from 'crypto'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import fs from 'fs'
+import { getParaguayDateTime } from './timezone-paraguay.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -76,6 +77,11 @@ db.serialize(() => {
     // Ignorar error si la columna ya existe
   })
   
+  // Agregar columna TipoUsuario: "Quivr/OpenAi" | "OCR/OpenAi" (para bases de datos existentes)
+  db.run(`ALTER TABLE users ADD COLUMN tipo_usuario TEXT DEFAULT 'Quivr/OpenAi'`, (err) => {
+    // Ignorar error si la columna ya existe
+  })
+  
   // Tabla de documentos (multi-tenancy)
   db.run(`CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +144,20 @@ db.serialize(() => {
     if (err) console.error('Error creando tabla whatsapp_sessions:', err)
   })
   
+  // Tabla Comprobantes (OCR): comprobantes extraídos por usuarios TipoUsuario = "OCR/OpenAi"
+  db.run(`CREATE TABLE IF NOT EXISTS comprobantes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    fechaComprobante TEXT,
+    numeroComprobante TEXT,
+    importe REAL,
+    descripcion TEXT,
+    fechaHoraRegistro DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )`, (err) => {
+    if (err) console.error('Error creando tabla comprobantes:', err)
+  })
+  
   // Crear índices para mejorar performance
   db.run(`CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id)`, (err) => {
     if (err && !err.message.includes('already exists')) console.error('Error creando índice documents:', err)
@@ -153,6 +173,10 @@ db.serialize(() => {
   
   db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_sessions_user_id ON whatsapp_sessions(user_id)`, (err) => {
     if (err && !err.message.includes('already exists')) console.error('Error creando índice whatsapp_sessions:', err)
+  })
+  
+  db.run(`CREATE INDEX IF NOT EXISTS idx_comprobantes_user_id ON comprobantes(user_id)`, (err) => {
+    if (err && !err.message.includes('already exists')) console.error('Error creando índice comprobantes:', err)
   })
   
   // Tabla de auditoría de conversaciones
@@ -221,17 +245,17 @@ db.serialize(() => {
   // Crear usuario admin por defecto si no existe
   db.get('SELECT * FROM users WHERE username = ?', ['admin'], (err, row) => {
     if (!row) {
-      const defaultPassword = 'admin123'
+      const defaultPassword = 'admin*12345'
       bcrypt.hash(defaultPassword, 10, (err, hash) => {
         if (!err) {
           const token = crypto.randomBytes(32).toString('hex')
           db.run(
-            'INSERT INTO users (username, password, token, role) VALUES (?, ?, ?, ?)',
-            ['admin', hash, token, 'admin'],
+            'INSERT INTO users (username, password, token, role, created_at) VALUES (?, ?, ?, ?, ?)',
+            ['admin', hash, token, 'admin', getParaguayDateTime()],
             function(insertErr) {
               if (!insertErr) {
                 const adminUserId = this.lastID
-                console.log('Usuario admin creado. Contraseña: admin123')
+                console.log('Usuario admin creado. Contraseña: admin*12345')
                 // Crear carpeta de documentos para el admin
                 createUserDocumentsFolder(adminUserId)
               }
@@ -306,8 +330,8 @@ app.post('/api/auth/login', async (req, res) => {
     // Generar nuevo token
     const newToken = generateToken()
     db.run(
-      'UPDATE users SET token = ?, last_login = CURRENT_TIMESTAMP WHERE id = ?',
-      [newToken, user.id],
+      'UPDATE users SET token = ?, last_login = ? WHERE id = ?',
+      [newToken, getParaguayDateTime(), user.id],
       (err) => {
         if (err) {
           return res.status(500).json({ error: 'Error al generar token' })
@@ -317,6 +341,7 @@ app.post('/api/auth/login', async (req, res) => {
           token: newToken,
           username: user.username,
           role: user.role || 'user',
+          tipo_usuario: user.tipo_usuario || 'Quivr/OpenAi',
           message: 'Login exitoso'
         })
       }
@@ -344,8 +369,8 @@ app.post('/api/auth/register', async (req, res) => {
   const token = generateToken()
   
   db.run(
-    'INSERT INTO users (username, password, token, role) VALUES (?, ?, ?, ?)',
-    [username, hashedPassword, token, role],
+    'INSERT INTO users (username, password, token, role, created_at) VALUES (?, ?, ?, ?, ?)',
+    [username, hashedPassword, token, role, getParaguayDateTime()],
     function(err) {
       if (err) {
         if (err.message.includes('UNIQUE constraint')) {
@@ -372,7 +397,8 @@ app.get('/api/auth/verify', authenticateToken, (req, res) => {
   res.json({
     valid: true,
     username: req.user.username,
-    role: req.user.role || 'user'
+    role: req.user.role || 'user',
+    tipo_usuario: req.user.tipo_usuario || 'Quivr/OpenAi'
   })
 })
 
@@ -386,7 +412,7 @@ function requireAdmin(req, res, next) {
 
 app.get('/api/auth/users', authenticateToken, requireAdmin, (req, res) => {
   // Filtrar usuarios con ID válido (no NULL) y ordenar por ID (más confiable que created_at)
-  db.all('SELECT id, username, role, token, openai_api_key, whatsapp_id, whatsapp_number, created_at, last_login FROM users WHERE id IS NOT NULL ORDER BY id DESC', [], (err, users) => {
+  db.all('SELECT id, username, role, token, openai_api_key, whatsapp_id, whatsapp_number, created_at, last_login, tipo_usuario FROM users WHERE id IS NOT NULL ORDER BY id DESC', [], (err, users) => {
     if (err) {
       console.error('Error al obtener usuarios:', err)
       return res.status(500).json({ error: 'Error al obtener usuarios' })
@@ -394,17 +420,22 @@ app.get('/api/auth/users', authenticateToken, requireAdmin, (req, res) => {
     // Asegurar que todos los campos estén presentes y que el ID sea válido
     const usersWithTokens = users
       .filter(user => user.id !== null && user.id !== undefined && user.id !== 'None') // Filtrar usuarios con ID inválido
-      .map(user => ({
-        id: user.id,
-        username: user.username,
-        role: user.role || 'user',
-        token: user.token || null,
-        openai_api_key: user.openai_api_key || null,
-        whatsapp_id: user.whatsapp_id || null,
-        whatsapp_number: user.whatsapp_number || null,
-        created_at: user.created_at || null,
-        last_login: user.last_login || null
-      }))
+      .map(user => {
+        const tipo = (user.tipo_usuario && String(user.tipo_usuario).trim()) || 'Quivr/OpenAi'
+        const tipoUsuario = tipo === 'OCR/OpenAi' ? 'OCR/OpenAi' : 'Quivr/OpenAi'
+        return {
+          id: user.id,
+          username: user.username,
+          role: user.role || 'user',
+          token: user.token || null,
+          openai_api_key: user.openai_api_key || null,
+          whatsapp_id: user.whatsapp_id || null,
+          whatsapp_number: user.whatsapp_number || null,
+          created_at: user.created_at || null,
+          last_login: user.last_login || null,
+          tipo_usuario: tipoUsuario
+        }
+      })
     console.log(`✅ Usuarios obtenidos: ${usersWithTokens.length}`)
     console.log(`✅ IDs de usuarios: ${usersWithTokens.map(u => u.id).join(', ')}`)
     res.json(usersWithTokens)
@@ -437,7 +468,8 @@ app.post('/api/auth/users/:id/regenerate-token', authenticateToken, requireAdmin
 })
 
 app.post('/api/auth/users', authenticateToken, requireAdmin, async (req, res) => {
-  const { username, password, role = 'user', openai_api_key = null } = req.body
+  const { username, password, role = 'user', openai_api_key = null, tipo_usuario: bodyTipo, tipoUsuario } = req.body
+  const tipo_usuario = (bodyTipo || tipoUsuario || 'Quivr/OpenAi').toString().trim()
   
   if (!username || !password) {
     return res.status(400).json({ error: 'Usuario y contraseña son requeridos' })
@@ -451,12 +483,17 @@ app.post('/api/auth/users', authenticateToken, requireAdmin, async (req, res) =>
     return res.status(400).json({ error: 'Rol inválido' })
   }
   
+  const tipoUsuarioValido = tipo_usuario === 'Quivr/OpenAi' || tipo_usuario === 'OCR/OpenAi'
+  if (!tipoUsuarioValido) {
+    return res.status(400).json({ error: 'Tipo de usuario inválido. Debe ser "Quivr/OpenAi" o "OCR/OpenAi"' })
+  }
+  
   const hashedPassword = await bcrypt.hash(password, 10)
   const token = generateToken()
   
   db.run(
-    'INSERT INTO users (username, password, token, role, openai_api_key) VALUES (?, ?, ?, ?, ?)',
-    [username, hashedPassword, token, role, openai_api_key],
+    'INSERT INTO users (username, password, token, role, openai_api_key, tipo_usuario, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [username, hashedPassword, token, role, openai_api_key, tipo_usuario, getParaguayDateTime()],
     function(err) {
       if (err) {
         console.error('❌ Error al crear usuario:', err)
@@ -492,27 +529,48 @@ app.post('/api/auth/users', authenticateToken, requireAdmin, async (req, res) =>
 app.put('/api/auth/users/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params
   const { username, password, role, openai_api_key } = req.body
-  
+  // Leer tipo_usuario tal como lo envía el frontend (puede ser tipo_usuario o tipoUsuario)
+  const tipo_usuario = req.body.tipo_usuario !== undefined
+    ? String(req.body.tipo_usuario).trim()
+    : req.body.tipoUsuario !== undefined
+      ? String(req.body.tipoUsuario).trim()
+      : undefined
+
+  // Depuración: ver qué llega y qué se incluirá en updates
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[PUT /users/:id] req.body:', JSON.stringify(req.body))
+    console.log('[PUT /users/:id] tipo_usuario parsed:', tipo_usuario)
+  }
+
   // Verificar que el usuario existe
   db.get('SELECT * FROM users WHERE id = ?', [id], async (err, user) => {
     if (err || !user) {
       return res.status(404).json({ error: 'Usuario no encontrado' })
     }
-    
+
     const updates = []
     const values = []
-    
+
     if (username && username !== user.username) {
       updates.push('username = ?')
       values.push(username)
     }
-    
+
     if (role && role !== user.role) {
       if (role !== 'admin' && role !== 'user') {
         return res.status(400).json({ error: 'Rol inválido' })
       }
       updates.push('role = ?')
       values.push(role)
+    }
+
+    // tipo_usuario: incluir siempre que venga en el body y sea válido (aunque sea igual al actual)
+    if (tipo_usuario !== undefined && tipo_usuario !== '') {
+      if (tipo_usuario !== 'Quivr/OpenAi' && tipo_usuario !== 'OCR/OpenAi') {
+        return res.status(400).json({ error: 'Tipo de usuario inválido. Debe ser "Quivr/OpenAi" o "OCR/OpenAi"' })
+      }
+      updates.push('tipo_usuario = ?')
+      values.push(tipo_usuario)
     }
     
     // Procesar openai_api_key - aceptar string vacío, null o undefined como null
@@ -541,6 +599,9 @@ app.put('/api/auth/users/:id', authenticateToken, requireAdmin, async (req, res)
     }
     
     if (updates.length === 0) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[PUT /users/:id] No hay cambios. updates:', updates.length, 'body keys:', Object.keys(req.body || {}))
+      }
       return res.status(400).json({ error: 'No hay cambios para actualizar' })
     }
     
@@ -581,6 +642,41 @@ app.delete('/api/auth/users/:id', authenticateToken, requireAdmin, (req, res) =>
     }
     
     res.json({ message: 'Usuario eliminado exitosamente' })
+  })
+})
+
+// Comprobantes (OCR): listar comprobantes del usuario autenticado
+app.get('/api/auth/comprobantes', authenticateToken, (req, res) => {
+  const userId = req.user.id
+  db.all(
+    'SELECT id, fechaComprobante, numeroComprobante, importe, descripcion, fechaHoraRegistro FROM comprobantes WHERE user_id = ? ORDER BY fechaHoraRegistro DESC',
+    [userId],
+    (err, rows) => {
+      if (err) {
+        console.error('Error al obtener comprobantes:', err)
+        return res.status(500).json({ error: 'Error al obtener comprobantes' })
+      }
+      res.json(rows || [])
+    }
+  )
+})
+
+// Comprobantes: eliminar un comprobante (solo del usuario autenticado)
+app.delete('/api/auth/comprobantes/:id', authenticateToken, (req, res) => {
+  const userId = req.user.id
+  const id = parseInt(req.params.id, 10)
+  if (isNaN(id)) {
+    return res.status(400).json({ error: 'ID inválido' })
+  }
+  db.run('DELETE FROM comprobantes WHERE id = ? AND user_id = ?', [id, userId], function (err) {
+    if (err) {
+      console.error('Error al eliminar comprobante:', err)
+      return res.status(500).json({ error: 'Error al eliminar comprobante' })
+    }
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Comprobante no encontrado' })
+    }
+    res.json({ message: 'Comprobante eliminado' })
   })
 })
 

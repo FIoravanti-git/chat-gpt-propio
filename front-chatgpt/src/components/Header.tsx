@@ -17,10 +17,10 @@ export default function Header() {
         <div className="header-content">
           <img 
             src="/Logo_tabacman.png" 
-            alt="Tabacman" 
+            alt="NeuroChat" 
             className="header-logo"
           />
-          <h1 className="header-title">Tabacman IA</h1>
+          <h1 className="header-title">NeuroChat</h1>
         </div>
         <div className="header-user">
           {isAdmin && (

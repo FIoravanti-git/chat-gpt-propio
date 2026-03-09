@@ -16,16 +16,31 @@ else
     exit 1
 fi
 
-# Activar entorno virtual si existe
-if [ -d "venv" ]; then
+# Activar entorno virtual solo si existe y está completo
+if [ -f "venv/bin/activate" ]; then
     echo "🔧 Activando entorno virtual..."
     source venv/bin/activate
+    PYTHON_CMD=python3
+elif [ -d "venv" ]; then
+    echo "⚠️  Carpeta venv existe pero está incompleta (falta venv/bin/activate)."
+    echo "   Para arreglarlo: sudo apt install python3-pip python3.10-venv"
+    echo "   Luego: rm -rf venv && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+    echo ""
+    PYTHON_CMD=python3
+else
+    :
 fi
 
 # Verificar que las dependencias estén instaladas
 if ! $PYTHON_CMD -c "import fastapi" 2>/dev/null; then
     echo "❌ FastAPI no está instalado. Instalando dependencias..."
-    $PIP_CMD -m pip install fastapi uvicorn[standard] python-multipart pydantic python-dotenv rich
+    if $PYTHON_CMD -m pip install fastapi "uvicorn[standard]" python-multipart pydantic python-dotenv rich 2>/dev/null; then
+        echo "✅ Dependencias instaladas."
+    else
+        echo "❌ No se pudo instalar. Instala pip y venv: sudo apt install python3-pip python3.10-venv"
+        echo "   Luego recrea el venv: rm -rf venv && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+        exit 1
+    fi
 fi
 
 # Verificar API key

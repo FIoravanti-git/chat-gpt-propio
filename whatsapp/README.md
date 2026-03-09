@@ -35,7 +35,7 @@ npm start
 
 ### Base URL
 ```
-http://localhost:3000
+http://localhost:3001
 ```
 
 ### Endpoints
@@ -161,14 +161,14 @@ Cuando registres un webhook, recibirás notificaciones automáticas cuando llegu
 
 ### Enviar mensaje
 ```bash
-curl -X POST http://localhost:3000/api/send-message \
+curl -X POST http://localhost:3001/api/send-message \
   -H "Content-Type: application/json" \
   -d '{"number": "1234567890", "message": "Hola!"}'
 ```
 
 ### Registrar webhook
 ```bash
-curl -X POST http://localhost:3000/api/webhooks \
+curl -X POST http://localhost:3001/api/webhooks \
   -H "Content-Type: application/json" \
   -d '{"url": "https://tu-servidor.com/webhook"}'
 ```
